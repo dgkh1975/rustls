@@ -1,5 +1,9 @@
-on: [push, pull_request]
 name: rustls
+
+permissions:
+  contents: read
+
+on: [push, pull_request]
 
 jobs:
   build:
@@ -12,7 +16,7 @@ jobs:
           - stable
           - beta
           - nightly
-          - 1.47.0 # our MSRV
+          - 1.52.1 # MSRV as recommend by https://blog.rust-lang.org/2021/05/10/Rust-1.52.1.html
         os: [ubuntu-18.04]
         # but only stable on macos/windows (slower platforms)
         include:
@@ -23,6 +27,8 @@ jobs:
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
+        with:
+          persist-credentials: false
 
       - name: Install ${{ matrix.rust }} toolchain
         uses: actions-rs/toolchain@v1
@@ -54,18 +60,112 @@ jobs:
       - name: cargo test (release; no run)
         run: cargo test --release --no-run
 
+
+  bogo:
+    name: BoGo test suite
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Install golang toolchain
+        uses: actions/setup-go@v2
+        with:
+          go-version: "1.14"
+
+      - name: Run test suite
+        working-directory: bogo
+        run: ./runme
+
+
+  fuzz:
+    name: Smoke-test fuzzing targets
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Install nightly toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+          default: true
+
+      - name: Install cargo fuzz
+        run: cargo install cargo-fuzz
+
+      - name: Smoke-test fuzz targets
+        run: |
+          cargo fuzz build
+          for target in $(cargo fuzz list) ; do
+            cargo fuzz run $target -- -max_total_time=10
+          done
+
+
+  benchmarks:
+    name: Smoke-test benchmarks
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Install stable toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+
+      - name: Smoke-test benchmark program
+        run: cargo run --release --example bench
+
+  docs:
+    name: Check for documentation errors
+    runs-on: ubuntu-18.04
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+          default: true
+
+      - name: cargo doc (all features)
+        run: cargo doc --all-features --no-deps --workspace
+        env:
+          RUSTDOCFLAGS: -Dwarnings
+
   coverage:
     name: Measure coverage
     runs-on: ubuntu-18.04
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
+        with:
+          persist-credentials: false
 
-      - name: Install LLVM11
+      - name: Install LLVM12
         run: |
           curl https://apt.llvm.org/llvm-snapshot.gpg.key | sudo apt-key add -
-          sudo apt-add-repository -y 'deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-11 main'
-          sudo apt-get install -y clang-11
+          sudo apt-add-repository -y 'deb http://apt.llvm.org/bionic/ llvm-toolchain-bionic-12 main'
+          sudo apt-get install -y clang-12
 
       - name: Install rust toolchain
         uses: actions-rs/toolchain@v1
@@ -79,9 +179,6 @@ jobs:
         with:
           go-version: "1.14"
 
-      - name: Install dependencies
-        run: sudo apt-get install llvm llvm-7 libclang-common-7-dev llvm-7-dev
-
       - name: Build lcov
         run: admin/build-lcov
 
@@ -94,12 +191,15 @@ jobs:
           file: final.info
           fail_ci_if_error: false
 
+
   minver:
     name: Check minimum versions
     runs-on: ubuntu-18.04
     steps:
       - name: Checkout sources
         uses: actions/checkout@v2
+        with:
+          persist-credentials: false
 
       - name: Install rust toolchain
         uses: actions-rs/toolchain@v1
@@ -110,3 +210,61 @@ jobs:
 
       - name: cargo test (debug; all features; -Z minimal-versions)
         run: cargo -Z minimal-versions test --all-features
+
+  format:
+    name: Format
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly-2021-03-30
+          override: true
+          default: true
+      - name: Check formatting
+        run: |
+          ./admin/fmt -- --check
+
+  clippy:
+    name: Clippy
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: stable
+          override: true
+          default: true
+          components: clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: -p rustls --all-features -- -D warnings
+
+  clippy-nightly:
+    name: Clippy (Nightly)
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout sources
+        uses: actions/checkout@v2
+        with:
+          persist-credentials: false
+      - name: Install rust toolchain
+        uses: actions-rs/toolchain@v1
+        with:
+          toolchain: nightly
+          override: true
+          default: true
+          components: clippy
+      - uses: actions-rs/cargo@v1
+        with:
+          command: clippy
+          args: -p rustls --all-features

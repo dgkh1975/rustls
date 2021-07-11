@@ -1,33 +1,37 @@
-use crate::anchors;
-use crate::error::TLSError;
+use crate::builder::{ConfigBuilder, WantsCipherSuites};
+use crate::conn::{Connection, ConnectionCommon, IoState, PlaintextSink, Protocol, Reader, Writer};
+use crate::error::Error;
 use crate::key;
-use crate::keylog::{KeyLog, NoKeyLog};
+use crate::keylog::KeyLog;
+use crate::kx::SupportedKxGroup;
 #[cfg(feature = "logging")]
 use crate::log::trace;
+#[cfg(feature = "quic")]
+use crate::msgs::enums::AlertDescription;
 use crate::msgs::enums::CipherSuite;
+use crate::msgs::enums::ProtocolVersion;
 use crate::msgs::enums::SignatureScheme;
-use crate::msgs::enums::{AlertDescription, HandshakeType};
-use crate::msgs::enums::{ContentType, ProtocolVersion};
-use crate::msgs::handshake::CertificatePayload;
-use crate::msgs::handshake::ClientExtension;
-use crate::msgs::message::Message;
-use crate::session::{MiddleboxCCS, Session, SessionCommon};
+use crate::msgs::handshake::{CertificatePayload, ClientExtension};
 use crate::sign;
-use crate::suites::{SupportedCipherSuite, ALL_CIPHERSUITES};
+use crate::suites::SupportedCipherSuite;
 use crate::verify;
+use crate::versions;
 
+#[cfg(feature = "quic")]
+use crate::quic;
+
+use std::convert::TryFrom;
 use std::fmt;
 use std::io::{self, IoSlice};
+use std::marker::PhantomData;
 use std::mem;
 use std::sync::Arc;
 
-use sct;
-use webpki;
-
 #[macro_use]
 mod hs;
+pub(super) mod builder;
 mod common;
-pub mod handy;
+pub(super) mod handy;
 mod tls12;
 mod tls13;
 
@@ -70,7 +74,7 @@ pub trait ResolvesClientCert: Send + Sync {
         &self,
         acceptable_issuers: &[&[u8]],
         sigschemes: &[SignatureScheme],
-    ) -> Option<sign::CertifiedKey>;
+    ) -> Option<Arc<sign::CertifiedKey>>;
 
     /// Return true if any certificates at all are available.
     fn has_certs(&self) -> bool;
@@ -81,29 +85,48 @@ pub trait ResolvesClientCert: Send + Sync {
 ///
 /// Making one of these can be expensive, and should be
 /// once per process rather than once per connection.
+///
+/// These must be created via the [`ClientConfig::builder()`] function.
+///
+/// # Defaults
+///
+/// * [`ClientConfig::max_fragment_size`]: the default is `None`: TLS packets are not fragmented to a specific size.
+/// * [`ClientConfig::session_storage`]: the default stores 256 sessions in memory.
+/// * [`ClientConfig::alpn_protocols`]: the default is empty -- no ALPN protocol is negotiated.
+/// * [`ClientConfig::key_log`]: key material is not logged.
 #[derive(Clone)]
 pub struct ClientConfig {
     /// List of ciphersuites, in preference order.
-    pub ciphersuites: Vec<&'static SupportedCipherSuite>,
+    cipher_suites: Vec<SupportedCipherSuite>,
 
-    /// Collection of root certificates.
-    pub root_store: anchors::RootCertStore,
+    /// List of supported key exchange algorithms, in preference order -- the
+    /// first element is the highest priority.
+    ///
+    /// The first element in this list is the _default key share algorithm_,
+    /// and in TLS1.3 a key share for it is sent in the client hello.
+    kx_groups: Vec<&'static SupportedKxGroup>,
 
     /// Which ALPN protocols we include in our client hello.
     /// If empty, no ALPN extension is sent.
     pub alpn_protocols: Vec<Vec<u8>>,
 
     /// How we store session data or tickets.
-    pub session_persistence: Arc<dyn StoresClientSessions>,
+    pub session_storage: Arc<dyn StoresClientSessions>,
 
-    /// Our MTU.  If None, we don't limit TLS message sizes.
-    pub mtu: Option<usize>,
+    /// The maximum size of TLS message we'll emit.  If None, we don't limit TLS
+    /// message lengths except to the 2**16 limit specified in the standard.
+    ///
+    /// rustls enforces an arbitrary minimum of 32 bytes for this field.
+    /// Out of range values are reported as errors from ClientConnection::new.
+    ///
+    /// Setting this value to the TCP MSS may improve latency for stream-y workloads.
+    pub max_fragment_size: Option<usize>,
 
     /// How to decide what client auth certificate/keys to use.
     pub client_auth_cert_resolver: Arc<dyn ResolvesClientCert>,
 
     /// Whether to support RFC5077 tickets.  You must provide a working
-    /// `session_persistence` member for this to have any meaningful
+    /// `session_storage` member for this to have any meaningful
     /// effect.
     ///
     /// The default is true.
@@ -111,12 +134,7 @@ pub struct ClientConfig {
 
     /// Supported versions, in no particular order.  The default
     /// is all supported versions.
-    pub versions: Vec<ProtocolVersion>,
-
-    /// Collection of certificate transparency logs.
-    /// If this collection is empty, then certificate transparency
-    /// checking is disabled.
-    pub ct_logs: Option<&'static [&'static sct::Log<'static>]>,
+    versions: versions::EnabledVersions,
 
     /// Whether to send the Server Name Indication (SNI) extension
     /// during the client handshake.
@@ -138,42 +156,14 @@ pub struct ClientConfig {
     pub enable_early_data: bool,
 }
 
-impl Default for ClientConfig {
-    fn default() -> Self {
-        Self::new()
-    }
-}
-
 impl ClientConfig {
-    /// Make a `ClientConfig` with a default set of ciphersuites,
-    /// no root certificates, no ALPN protocols, and no client auth.
+    /// Create a builder to build up the client configuration.
     ///
-    /// The default session persistence provider stores up to 32
-    /// items in memory.
-    pub fn new() -> ClientConfig {
-        ClientConfig::with_ciphersuites(&ALL_CIPHERSUITES)
-    }
-
-    /// Make a `ClientConfig` with a custom set of ciphersuites,
-    /// no root certificates, no ALPN protocols, and no client auth.
-    ///
-    /// The default session persistence provider stores up to 32
-    /// items in memory.
-    pub fn with_ciphersuites(ciphersuites: &[&'static SupportedCipherSuite]) -> ClientConfig {
-        ClientConfig {
-            ciphersuites: ciphersuites.to_vec(),
-            root_store: anchors::RootCertStore::empty(),
-            alpn_protocols: Vec::new(),
-            session_persistence: handy::ClientSessionMemoryCache::new(32),
-            mtu: None,
-            client_auth_cert_resolver: Arc::new(handy::FailResolveClientCert {}),
-            enable_tickets: true,
-            versions: vec![ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2],
-            ct_logs: None,
-            enable_sni: true,
-            verifier: Arc::new(verify::WebPKIVerifier),
-            key_log: Arc::new(NoKeyLog {}),
-            enable_early_data: false,
+    /// For more information, see the [`ConfigBuilder`] documentation.
+    pub fn builder() -> ConfigBuilder<Self, WantsCipherSuites> {
+        ConfigBuilder {
+            state: WantsCipherSuites(()),
+            side: PhantomData::default(),
         }
     }
 
@@ -182,63 +172,11 @@ impl ClientConfig {
     /// versions *and* at least one ciphersuite for this version is
     /// also configured.
     pub fn supports_version(&self, v: ProtocolVersion) -> bool {
-        self.versions.contains(&v)
+        self.versions.contains(v)
             && self
-                .ciphersuites
+                .cipher_suites
                 .iter()
-                .any(|cs| cs.usable_for_version(v))
-    }
-
-    #[doc(hidden)]
-    pub fn get_verifier(&self) -> &dyn verify::ServerCertVerifier {
-        self.verifier.as_ref()
-    }
-
-    /// Set the ALPN protocol list to the given protocol names.
-    /// Overwrites any existing configured protocols.
-    /// The first element in the `protocols` list is the most
-    /// preferred, the last is the least preferred.
-    pub fn set_protocols(&mut self, protocols: &[Vec<u8>]) {
-        self.alpn_protocols.clear();
-        self.alpn_protocols
-            .extend_from_slice(protocols);
-    }
-
-    /// Sets persistence layer to `persist`.
-    pub fn set_persistence(&mut self, persist: Arc<dyn StoresClientSessions>) {
-        self.session_persistence = persist;
-    }
-
-    /// Sets MTU to `mtu`.  If None, the default is used.
-    /// If Some(x) then x must be greater than 5 bytes.
-    pub fn set_mtu(&mut self, mtu: &Option<usize>) {
-        // Internally our MTU relates to fragment size, and does
-        // not include the TLS header overhead.
-        //
-        // Externally the MTU is the whole packet size.  The difference
-        // is PACKET_OVERHEAD.
-        if let Some(x) = *mtu {
-            use crate::msgs::fragmenter;
-            debug_assert!(x > fragmenter::PACKET_OVERHEAD);
-            self.mtu = Some(x - fragmenter::PACKET_OVERHEAD);
-        } else {
-            self.mtu = None;
-        }
-    }
-
-    /// Sets a single client authentication certificate and private key.
-    /// This is blindly used for all servers that ask for client auth.
-    ///
-    /// `cert_chain` is a vector of DER-encoded certificates,
-    /// `key_der` is a DER-encoded RSA or ECDSA private key.
-    pub fn set_single_client_cert(
-        &mut self,
-        cert_chain: Vec<key::Certificate>,
-        key_der: key::PrivateKey,
-    ) -> Result<(), TLSError> {
-        let resolver = handy::AlwaysResolvesClientCert::new(cert_chain, &key_der)?;
-        self.client_auth_cert_resolver = Arc::new(resolver);
-        Ok(())
+                .any(|cs| cs.version().version == v)
     }
 
     /// Access configuration options whose use is dangerous and requires
@@ -247,11 +185,92 @@ impl ClientConfig {
     pub fn dangerous(&mut self) -> danger::DangerousClientConfig {
         danger::DangerousClientConfig { cfg: self }
     }
+
+    fn find_cipher_suite(&self, suite: CipherSuite) -> Option<SupportedCipherSuite> {
+        self.cipher_suites
+            .iter()
+            .copied()
+            .find(|&scs| scs.suite() == suite)
+    }
 }
+
+/// Encodes ways a client can know the expected name of the server.
+///
+/// This currently covers knowing the DNS name of the server, but
+/// will be extended in the future to knowing the IP address of the
+/// server, as well as supporting privacy-preserving names for the
+/// server ("ECH").  For this reason this enum is `non_exhaustive`.
+///
+/// # Making one
+///
+/// If you have a DNS name as a `&str`, this type implements `TryFrom<&str>`,
+/// so you can do:
+///
+/// ```
+/// # use std::convert::{TryInto, TryFrom};
+/// # use rustls::ServerName;
+/// ServerName::try_from("example.com").expect("invalid DNS name");
+///
+/// // or, alternatively...
+///
+/// let x = "example.com".try_into().expect("invalid DNS name");
+/// # let _: ServerName = x;
+/// ```
+#[non_exhaustive]
+#[derive(Debug, PartialEq, Clone)]
+pub enum ServerName {
+    /// The server is identified by a DNS name.  The name
+    /// is sent in the TLS Server Name Indication (SNI)
+    /// extension.
+    DnsName(verify::DnsName),
+}
+
+impl ServerName {
+    /// Return the name that should go in the SNI extension.
+    /// If [`None`] is returned, the SNI extension is not included
+    /// in the handshake.
+    pub(crate) fn for_sni(&self) -> Option<webpki::DnsNameRef> {
+        match self {
+            Self::DnsName(dns_name) => Some(dns_name.0.as_ref()),
+        }
+    }
+
+    /// Return a prefix-free, unique encoding for the name.
+    pub(crate) fn encode(&self) -> Vec<u8> {
+        enum UniqueTypeCode {
+            DnsName = 0x01,
+        }
+
+        let Self::DnsName(dns_name) = self;
+        let bytes = dns_name.0.as_ref();
+
+        let mut r = Vec::with_capacity(2 + bytes.as_ref().len());
+        r.push(UniqueTypeCode::DnsName as u8);
+        r.push(bytes.as_ref().len() as u8);
+        r.extend_from_slice(bytes.as_ref());
+
+        r
+    }
+}
+
+/// Attempt to make a ServerName from a string by parsing
+/// it as a DNS name.
+impl TryFrom<&str> for ServerName {
+    type Error = InvalidDnsNameError;
+    fn try_from(s: &str) -> Result<Self, Self::Error> {
+        match webpki::DnsNameRef::try_from_ascii_str(s) {
+            Ok(dns) => Ok(Self::DnsName(verify::DnsName(dns.into()))),
+            Err(webpki::InvalidDnsNameError) => Err(InvalidDnsNameError),
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct InvalidDnsNameError;
 
 /// Container for unsafe APIs
 #[cfg(feature = "dangerous_configuration")]
-pub mod danger {
+pub(super) mod danger {
     use std::sync::Arc;
 
     use super::verify::ServerCertVerifier;
@@ -280,31 +299,28 @@ enum EarlyDataState {
     Rejected,
 }
 
-pub struct EarlyData {
+pub(super) struct EarlyData {
     state: EarlyDataState,
     left: usize,
 }
 
 impl EarlyData {
-    fn new() -> EarlyData {
-        EarlyData {
+    fn new() -> Self {
+        Self {
             left: 0,
             state: EarlyDataState::Disabled,
         }
     }
 
     fn is_enabled(&self) -> bool {
-        match self.state {
-            EarlyDataState::Ready | EarlyDataState::Accepted => true,
-            _ => false,
-        }
+        matches!(self.state, EarlyDataState::Ready | EarlyDataState::Accepted)
     }
 
     fn is_accepted(&self) -> bool {
-        match self.state {
-            EarlyDataState::Accepted | EarlyDataState::AcceptedFinished => true,
-            _ => false,
-        }
+        matches!(
+            self.state,
+            EarlyDataState::Accepted | EarlyDataState::AcceptedFinished
+        )
     }
 
     fn enable(&mut self, max_data: usize) {
@@ -358,18 +374,18 @@ impl EarlyData {
 
 /// Stub that implements io::Write and dispatches to `write_early_data`.
 pub struct WriteEarlyData<'a> {
-    sess: &'a mut ClientSessionImpl,
+    sess: &'a mut ClientConnection,
 }
 
 impl<'a> WriteEarlyData<'a> {
-    fn new(sess: &'a mut ClientSessionImpl) -> WriteEarlyData<'a> {
+    fn new(sess: &'a mut ClientConnection) -> WriteEarlyData<'a> {
         WriteEarlyData { sess }
     }
 
     /// How many bytes you may send.  Writes will become short
     /// once this reaches zero.
     pub fn bytes_left(&self) -> usize {
-        self.sess.early_data.bytes_left()
+        self.sess.data.early_data.bytes_left()
     }
 }
 
@@ -383,288 +399,48 @@ impl<'a> io::Write for WriteEarlyData<'a> {
     }
 }
 
-pub struct ClientSessionImpl {
-    pub config: Arc<ClientConfig>,
-    pub alpn_protocol: Option<Vec<u8>>,
-    pub common: SessionCommon,
-    pub error: Option<TLSError>,
-    pub state: Option<hs::NextState>,
-    pub server_cert_chain: CertificatePayload,
-    pub early_data: EarlyData,
-    pub resumption_ciphersuite: Option<&'static SupportedCipherSuite>,
+/// This represents a single TLS client connection.
+pub struct ClientConnection {
+    common: ConnectionCommon,
+    state: Option<hs::NextState>,
+    data: ClientConnectionData,
 }
 
-impl fmt::Debug for ClientSessionImpl {
+impl fmt::Debug for ClientConnection {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        f.debug_struct("ClientSessionImpl")
+        f.debug_struct("ClientConnection")
             .finish()
     }
 }
 
-impl ClientSessionImpl {
-    pub fn new(config: &Arc<ClientConfig>) -> ClientSessionImpl {
-        ClientSessionImpl {
-            config: config.clone(),
-            alpn_protocol: None,
-            common: SessionCommon::new(config.mtu, true),
-            error: None,
+impl ClientConnection {
+    /// Make a new ClientConnection.  `config` controls how
+    /// we behave in the TLS protocol, `name` is the
+    /// name of the server we want to talk to.
+    pub fn new(config: Arc<ClientConfig>, name: ServerName) -> Result<Self, Error> {
+        Self::new_inner(config, name, Vec::new(), Protocol::Tcp)
+    }
+
+    fn new_inner(
+        config: Arc<ClientConfig>,
+        name: ServerName,
+        extra_exts: Vec<ClientExtension>,
+        proto: Protocol,
+    ) -> Result<Self, Error> {
+        let mut new = Self {
+            common: ConnectionCommon::new(config.max_fragment_size, true)?,
             state: None,
-            server_cert_chain: Vec::new(),
-            early_data: EarlyData::new(),
-            resumption_ciphersuite: None,
-        }
-    }
-
-    pub fn start_handshake(&mut self, hostname: webpki::DNSName, extra_exts: Vec<ClientExtension>) {
-        self.state = Some(hs::start_handshake(self, hostname, extra_exts));
-    }
-
-    pub fn get_cipher_suites(&self) -> Vec<CipherSuite> {
-        let mut ret = Vec::new();
-
-        for cs in &self.config.ciphersuites {
-            ret.push(cs.suite);
-        }
-
-        // We don't do renegotiation at all, in fact.
-        ret.push(CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV);
-
-        ret
-    }
-
-    pub fn find_cipher_suite(&self, suite: CipherSuite) -> Option<&'static SupportedCipherSuite> {
-        for scs in &self.config.ciphersuites {
-            if scs.suite == suite {
-                return Some(scs);
-            }
-        }
-
-        None
-    }
-
-    pub fn wants_read(&self) -> bool {
-        // We want to read more data all the time, except when we
-        // have unprocessed plaintext.  This provides back-pressure
-        // to the TCP buffers.
-        //
-        // This also covers the handshake case, because we don't have
-        // readable plaintext before handshake has completed.
-        !self.common.has_readable_plaintext()
-    }
-
-    pub fn wants_write(&self) -> bool {
-        !self.common.sendable_tls.is_empty()
-    }
-
-    pub fn is_handshaking(&self) -> bool {
-        !self.common.traffic
-    }
-
-    pub fn set_buffer_limit(&mut self, len: usize) {
-        self.common.set_buffer_limit(len)
-    }
-
-    pub fn process_msg(&mut self, mut msg: Message) -> Result<(), TLSError> {
-        // TLS1.3: drop CCS at any time during handshaking
-        if let MiddleboxCCS::Drop = self.common.filter_tls13_ccs(&msg)? {
-            trace!("Dropping CCS");
-            return Ok(());
-        }
-
-        // Decrypt if demanded by current state.
-        if self.common.record_layer.is_decrypting() {
-            let dm = self.common.decrypt_incoming(msg)?;
-            msg = dm;
-        }
-
-        // For handshake messages, we need to join them before parsing
-        // and processing.
-        if self
-            .common
-            .handshake_joiner
-            .want_message(&msg)
-        {
-            self.common
-                .handshake_joiner
-                .take_message(msg)
-                .ok_or_else(|| {
-                    self.common
-                        .send_fatal_alert(AlertDescription::DecodeError);
-                    TLSError::CorruptMessagePayload(ContentType::Handshake)
-                })?;
-            return self.process_new_handshake_messages();
-        }
-
-        // Now we can fully parse the message payload.
-        if !msg.decode_payload() {
-            return Err(TLSError::CorruptMessagePayload(msg.typ));
-        }
-
-        // For alerts, we have separate logic.
-        if msg.is_content_type(ContentType::Alert) {
-            return self.common.process_alert(msg);
-        }
-
-        self.process_main_protocol(msg)
-    }
-
-    pub fn process_new_handshake_messages(&mut self) -> Result<(), TLSError> {
-        while let Some(msg) = self
-            .common
-            .handshake_joiner
-            .frames
-            .pop_front()
-        {
-            self.process_main_protocol(msg)?;
-        }
-
-        Ok(())
-    }
-
-    fn reject_renegotiation_attempt(&mut self) -> Result<(), TLSError> {
-        self.common
-            .send_warning_alert(AlertDescription::NoRenegotiation);
-        Ok(())
-    }
-
-    fn queue_unexpected_alert(&mut self) {
-        self.common
-            .send_fatal_alert(AlertDescription::UnexpectedMessage);
-    }
-
-    fn maybe_send_unexpected_alert(&mut self, rc: hs::NextStateOrError) -> hs::NextStateOrError {
-        match rc {
-            Err(TLSError::InappropriateMessage { .. })
-            | Err(TLSError::InappropriateHandshakeMessage { .. }) => {
-                self.queue_unexpected_alert();
-            }
-            _ => {}
+            data: ClientConnectionData::new(),
         };
-        rc
-    }
+        new.common.protocol = proto;
 
-    /// Process `msg`.  First, we get the current state.  Then we ask what messages
-    /// that state expects, enforced via `check_message`.  Finally, we ask the handler
-    /// to handle the message.
-    fn process_main_protocol(&mut self, msg: Message) -> Result<(), TLSError> {
-        // For TLS1.2, outside of the handshake, send rejection alerts for
-        // renegotiation requests.  These can occur any time.
-        if msg.is_handshake_type(HandshakeType::HelloRequest)
-            && !self.common.is_tls13()
-            && !self.is_handshaking()
-        {
-            return self.reject_renegotiation_attempt();
-        }
+        let mut cx = hs::ClientContext {
+            common: &mut new.common,
+            data: &mut new.data,
+        };
 
-        let state = self.state.take().unwrap();
-        let maybe_next_state = state.handle(self, msg);
-        let next_state = self.maybe_send_unexpected_alert(maybe_next_state)?;
-        self.state = Some(next_state);
-
-        Ok(())
-    }
-
-    pub fn process_new_packets(&mut self) -> Result<(), TLSError> {
-        if let Some(ref err) = self.error {
-            return Err(err.clone());
-        }
-
-        if self.common.message_deframer.desynced {
-            return Err(TLSError::CorruptMessage);
-        }
-
-        while let Some(msg) = self
-            .common
-            .message_deframer
-            .frames
-            .pop_front()
-        {
-            match self.process_msg(msg) {
-                Ok(_) => {}
-                Err(err) => {
-                    self.error = Some(err.clone());
-                    return Err(err);
-                }
-            }
-        }
-
-        Ok(())
-    }
-
-    pub fn get_peer_certificates(&self) -> Option<Vec<key::Certificate>> {
-        if self.server_cert_chain.is_empty() {
-            return None;
-        }
-
-        Some(
-            self.server_cert_chain
-                .iter()
-                .cloned()
-                .collect(),
-        )
-    }
-
-    pub fn get_alpn_protocol(&self) -> Option<&[u8]> {
-        self.alpn_protocol
-            .as_ref()
-            .map(AsRef::as_ref)
-    }
-
-    pub fn get_protocol_version(&self) -> Option<ProtocolVersion> {
-        self.common.negotiated_version
-    }
-
-    pub fn get_negotiated_ciphersuite(&self) -> Option<&'static SupportedCipherSuite> {
-        self.common.get_suite()
-    }
-
-    pub fn write_early_data(&mut self, data: &[u8]) -> io::Result<usize> {
-        self.early_data
-            .check_write(data.len())
-            .and_then(|sz| {
-                Ok(self
-                    .common
-                    .send_early_plaintext(&data[..sz]))
-            })
-    }
-
-    fn export_keying_material(
-        &self,
-        output: &mut [u8],
-        label: &[u8],
-        context: Option<&[u8]>,
-    ) -> Result<(), TLSError> {
-        self.state
-            .as_ref()
-            .ok_or_else(|| TLSError::HandshakeNotComplete)
-            .and_then(|st| st.export_keying_material(output, label, context))
-    }
-
-    fn send_some_plaintext(&mut self, buf: &[u8]) -> usize {
-        let mut st = self.state.take();
-        st.as_mut()
-            .map(|st| st.perhaps_write_key_update(self));
-        self.state = st;
-
-        self.common.send_some_plaintext(buf)
-    }
-}
-
-/// This represents a single TLS client session.
-#[derive(Debug)]
-pub struct ClientSession {
-    // We use the pimpl idiom to hide unimportant details.
-    pub(crate) imp: ClientSessionImpl,
-}
-
-impl ClientSession {
-    /// Make a new ClientSession.  `config` controls how
-    /// we behave in the TLS protocol, `hostname` is the
-    /// hostname of who we want to talk to.
-    pub fn new(config: &Arc<ClientConfig>, hostname: webpki::DNSNameRef) -> ClientSession {
-        let mut imp = ClientSessionImpl::new(config);
-        imp.start_handshake(hostname.into(), vec![]);
-        ClientSession { imp }
+        new.state = Some(hs::start_handshake(name, extra_exts, config, &mut cx)?);
+        Ok(new)
     }
 
     /// Returns an `io::Write` implementer you can write bytes to
@@ -686,8 +462,8 @@ impl ClientSession {
     /// in this case the data is lost but the connection continues.  You
     /// can tell this happened using `is_early_data_accepted`.
     pub fn early_data(&mut self) -> Option<WriteEarlyData> {
-        if self.imp.early_data.is_enabled() {
-            Some(WriteEarlyData::new(&mut self.imp))
+        if self.data.early_data.is_enabled() {
+            Some(WriteEarlyData::new(self))
         } else {
             None
         }
@@ -699,54 +475,79 @@ impl ClientSession {
     /// handshake then the server will not process the data.  This
     /// is not an error, but you may wish to resend the data.
     pub fn is_early_data_accepted(&self) -> bool {
-        self.imp.early_data.is_accepted()
+        self.data.early_data.is_accepted()
+    }
+
+    fn write_early_data(&mut self, data: &[u8]) -> io::Result<usize> {
+        self.data
+            .early_data
+            .check_write(data.len())
+            .map(|sz| {
+                self.common
+                    .send_early_plaintext(&data[..sz])
+            })
+    }
+
+    fn send_some_plaintext(&mut self, buf: &[u8]) -> usize {
+        let mut st = self.state.take();
+        if let Some(st) = st.as_mut() {
+            st.perhaps_write_key_update(&mut self.common);
+        }
+        self.state = st;
+
+        self.common.send_some_plaintext(buf)
     }
 }
 
-impl Session for ClientSession {
+impl Connection for ClientConnection {
     fn read_tls(&mut self, rd: &mut dyn io::Read) -> io::Result<usize> {
-        self.imp.common.read_tls(rd)
+        self.common.read_tls(rd)
     }
 
     /// Writes TLS messages to `wr`.
     fn write_tls(&mut self, wr: &mut dyn io::Write) -> io::Result<usize> {
-        self.imp.common.write_tls(wr)
+        self.common.write_tls(wr)
     }
 
-    fn process_new_packets(&mut self) -> Result<(), TLSError> {
-        self.imp.process_new_packets()
+    fn process_new_packets(&mut self) -> Result<IoState, Error> {
+        self.common
+            .process_new_packets(&mut self.state, &mut self.data)
     }
 
     fn wants_read(&self) -> bool {
-        self.imp.wants_read()
+        self.common.wants_read()
     }
 
     fn wants_write(&self) -> bool {
-        self.imp.wants_write()
+        !self.common.sendable_tls.is_empty()
     }
 
     fn is_handshaking(&self) -> bool {
-        self.imp.is_handshaking()
+        !self.common.traffic
     }
 
-    fn set_buffer_limit(&mut self, len: usize) {
-        self.imp.set_buffer_limit(len)
+    fn set_buffer_limit(&mut self, len: Option<usize>) {
+        self.common.set_buffer_limit(len)
     }
 
     fn send_close_notify(&mut self) {
-        self.imp.common.send_close_notify()
+        self.common.send_close_notify()
     }
 
-    fn get_peer_certificates(&self) -> Option<Vec<key::Certificate>> {
-        self.imp.get_peer_certificates()
+    fn peer_certificates(&self) -> Option<&[key::Certificate]> {
+        if self.data.server_cert_chain.is_empty() {
+            return None;
+        }
+
+        Some(&self.data.server_cert_chain)
     }
 
-    fn get_alpn_protocol(&self) -> Option<&[u8]> {
-        self.imp.get_alpn_protocol()
+    fn alpn_protocol(&self) -> Option<&[u8]> {
+        self.common.get_alpn_protocol()
     }
 
-    fn get_protocol_version(&self) -> Option<ProtocolVersion> {
-        self.imp.get_protocol_version()
+    fn protocol_version(&self) -> Option<ProtocolVersion> {
+        self.common.negotiated_version
     }
 
     fn export_keying_material(
@@ -754,61 +555,126 @@ impl Session for ClientSession {
         output: &mut [u8],
         label: &[u8],
         context: Option<&[u8]>,
-    ) -> Result<(), TLSError> {
-        self.imp
-            .export_keying_material(output, label, context)
+    ) -> Result<(), Error> {
+        self.state
+            .as_ref()
+            .ok_or(Error::HandshakeNotComplete)
+            .and_then(|st| st.export_keying_material(output, label, context))
     }
 
-    fn get_negotiated_ciphersuite(&self) -> Option<&'static SupportedCipherSuite> {
-        self.imp
-            .get_negotiated_ciphersuite()
-            .or(self.imp.resumption_ciphersuite)
+    fn negotiated_cipher_suite(&self) -> Option<SupportedCipherSuite> {
+        self.common
+            .get_suite()
+            .or(self.data.resumption_ciphersuite)
     }
-}
 
-impl io::Read for ClientSession {
-    /// Obtain plaintext data received from the peer over this TLS connection.
-    ///
-    /// If the peer closes the TLS session cleanly, this fails with an error of
-    /// kind ErrorKind::ConnectionAborted once all the pending data has been read.
-    /// No further data can be received on that connection, so the underlying TCP
-    /// connection should closed too.
-    ///
-    /// Note that support close notify varies in peer TLS libraries: many do not
-    /// support it and uncleanly close the TCP connection (this might be
-    /// vulnerable to truncation attacks depending on the application protocol).
-    /// This means applications using rustls must both handle ErrorKind::ConnectionAborted
-    /// from this function, *and* unexpected closure of the underlying TCP connection.
-    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
-        self.imp.common.read(buf)
+    fn writer(&mut self) -> Writer {
+        Writer::new(self)
+    }
+
+    fn reader(&mut self) -> Reader {
+        self.common.reader()
     }
 }
 
-impl io::Write for ClientSession {
-    /// Send the plaintext `buf` to the peer, encrypting
-    /// and authenticating it.  Once this function succeeds
-    /// you should call `write_tls` which will output the
-    /// corresponding TLS records.
-    ///
-    /// This function buffers plaintext sent before the
-    /// TLS handshake completes, and sends it as soon
-    /// as it can.  This buffer is of *unlimited size* so
-    /// writing much data before it can be sent will
-    /// cause excess memory usage.
+impl PlaintextSink for ClientConnection {
     fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        Ok(self.imp.send_some_plaintext(buf))
+        Ok(self.send_some_plaintext(buf))
     }
 
     fn write_vectored(&mut self, bufs: &[IoSlice<'_>]) -> io::Result<usize> {
         let mut sz = 0;
         for buf in bufs {
-            sz += self.imp.send_some_plaintext(buf);
+            sz += self.send_some_plaintext(buf);
         }
         Ok(sz)
     }
 
     fn flush(&mut self) -> io::Result<()> {
-        self.imp.common.flush_plaintext();
         Ok(())
     }
 }
+
+struct ClientConnectionData {
+    server_cert_chain: CertificatePayload,
+    early_data: EarlyData,
+    resumption_ciphersuite: Option<SupportedCipherSuite>,
+}
+
+impl ClientConnectionData {
+    fn new() -> Self {
+        Self {
+            server_cert_chain: Vec::new(),
+            early_data: EarlyData::new(),
+            resumption_ciphersuite: None,
+        }
+    }
+}
+
+#[cfg(feature = "quic")]
+impl quic::QuicExt for ClientConnection {
+    fn quic_transport_parameters(&self) -> Option<&[u8]> {
+        self.common
+            .quic
+            .params
+            .as_ref()
+            .map(|v| v.as_ref())
+    }
+
+    fn zero_rtt_keys(&self) -> Option<quic::DirectionalKeys> {
+        Some(quic::DirectionalKeys::new(
+            self.data
+                .resumption_ciphersuite
+                .and_then(|suite| suite.tls13())?,
+            self.common.quic.early_secret.as_ref()?,
+        ))
+    }
+
+    fn read_hs(&mut self, plaintext: &[u8]) -> Result<(), Error> {
+        quic::read_hs(&mut self.common, plaintext)?;
+        self.common
+            .process_new_handshake_messages(&mut self.state, &mut self.data)
+    }
+
+    fn write_hs(&mut self, buf: &mut Vec<u8>) -> Option<quic::Keys> {
+        quic::write_hs(&mut self.common, buf)
+    }
+
+    fn alert(&self) -> Option<AlertDescription> {
+        self.common.quic.alert
+    }
+
+    fn next_1rtt_keys(&mut self) -> Option<quic::PacketKeySet> {
+        quic::next_1rtt_keys(&mut self.common)
+    }
+}
+
+/// Methods specific to QUIC client sessions
+#[cfg(feature = "quic")]
+pub trait ClientQuicExt {
+    /// Make a new QUIC ClientConnection. This differs from `ClientConnection::new()`
+    /// in that it takes an extra argument, `params`, which contains the
+    /// TLS-encoded transport parameters to send.
+    fn new_quic(
+        config: Arc<ClientConfig>,
+        quic_version: quic::Version,
+        name: ServerName,
+        params: Vec<u8>,
+    ) -> Result<ClientConnection, Error> {
+        if !config.supports_version(ProtocolVersion::TLSv1_3) {
+            return Err(Error::General(
+                "TLS 1.3 support is required for QUIC".into(),
+            ));
+        }
+
+        let ext = match quic_version {
+            quic::Version::V1Draft => ClientExtension::TransportParametersDraft(params),
+            quic::Version::V1 => ClientExtension::TransportParameters(params),
+        };
+
+        ClientConnection::new_inner(config, name, vec![ext], Protocol::Quic)
+    }
+}
+
+#[cfg(feature = "quic")]
+impl ClientQuicExt for ClientConnection {}

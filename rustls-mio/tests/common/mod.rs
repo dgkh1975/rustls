@@ -192,13 +192,34 @@ pub fn openssl_find() -> String {
         return format!("{}/bin/openssl", dir);
     }
 
-    // We need a homebrew openssl, because OSX comes with
-    // 0.9.8y or something equally ancient!
+    // We may need a homebrew openssl, because older versions of OSX come with
+    // 0.9.8y or something equally ancient.
     if cfg!(target_os = "macos") {
-        if Path::new("/usr/local/opt/openssl@1.1/bin/openssl").is_file() {
-            return "/usr/local/opt/openssl@1.1/bin/openssl".to_string();
-        } else {
-            return "/usr/local/opt/openssl/bin/openssl".to_string();
+        match process::Command::new("brew")
+            .args(&["--prefix", "openssl"])
+            .output()
+        {
+            Ok(output) => {
+                let dir = str::from_utf8(&*output.stdout)
+                    .unwrap()
+                    .trim();
+                return format!("{}/bin/openssl", dir);
+            }
+            Err(_) => {
+                const SEARCH_PATHS: [&'static str; 3] = [
+                    "/usr/local/opt/openssl@1.1/bin/openssl",
+                    "/usr/local/opt/openssl/bin/openssl",
+                    // This may return LibreSSL 2.8.3 on Big Sur, and will currently fail a test.
+                    "/usr/bin/openssl",
+                ];
+
+                if let Some(path) = SEARCH_PATHS
+                    .iter()
+                    .find(|s| Path::new(s).is_file())
+                {
+                    return path.to_string();
+                }
+            }
         }
     }
 
@@ -246,14 +267,14 @@ pub struct TlsClient {
     pub no_sni: bool,
     pub insecure: bool,
     pub verbose: bool,
-    pub mtu: Option<usize>,
+    pub max_fragment_size: Option<usize>,
     pub expect_fails: bool,
     pub expect_output: Vec<String>,
     pub expect_log: Vec<String>,
 }
 
 impl TlsClient {
-    pub fn new(hostname: &str) -> TlsClient {
+    pub fn new(hostname: &str) -> Self {
         TlsClient {
             hostname: hostname.to_string(),
             port: 443,
@@ -266,7 +287,7 @@ impl TlsClient {
             no_sni: false,
             insecure: false,
             verbose: false,
-            mtu: None,
+            max_fragment_size: None,
             suites: Vec::new(),
             protos: Vec::new(),
             expect_fails: false,
@@ -311,8 +332,8 @@ impl TlsClient {
         self
     }
 
-    pub fn mtu(&mut self, mtu: usize) -> &mut TlsClient {
-        self.mtu = Some(mtu);
+    pub fn max_fragment_size(&mut self, max_fragment_size: usize) -> &mut TlsClient {
+        self.max_fragment_size = Some(max_fragment_size);
         self
     }
 
@@ -349,7 +370,7 @@ impl TlsClient {
     }
 
     pub fn go(&mut self) -> Option<()> {
-        let mtustring;
+        let fragstring;
         let portstring = self.port.to_string();
         let mut args = Vec::<&str>::new();
         args.push(&self.hostname);
@@ -425,10 +446,13 @@ impl TlsClient {
             args.push("--verbose");
         }
 
-        if self.mtu.is_some() {
-            args.push("--mtu");
-            mtustring = self.mtu.unwrap().to_string();
-            args.push(&mtustring);
+        if self.max_fragment_size.is_some() {
+            args.push("--max-frag-size");
+            fragstring = self
+                .max_fragment_size
+                .unwrap()
+                .to_string();
+            args.push(&fragstring);
         }
 
         let output = process::Command::new(tlsclient_find())
@@ -482,7 +506,7 @@ pub struct OpenSSLServer {
 }
 
 impl OpenSSLServer {
-    pub fn new(test_ca: &Path, keytype: &str, start_port: u16) -> OpenSSLServer {
+    pub fn new(test_ca: &Path, keytype: &str, start_port: u16) -> Self {
         OpenSSLServer {
             port: unused_port(start_port),
             http: true,
@@ -786,9 +810,9 @@ pub struct OpenSSLClient {
 }
 
 impl OpenSSLClient {
-    pub fn new(port: u16) -> OpenSSLClient {
+    pub fn new(port: u16) -> Self {
         OpenSSLClient {
-            port: port,
+            port,
             cafile: PathBuf::new(),
             extra_args: Vec::new(),
             expect_fails: false,

@@ -1,9 +1,7 @@
-use webpki;
-
 use crate::key;
 #[cfg(feature = "logging")]
 use crate::log::{debug, trace};
-pub use crate::msgs::handshake::{DistinguishedName, DistinguishedNames};
+use crate::msgs::handshake::{DistinguishedName, DistinguishedNames};
 use crate::x509;
 
 /// This is like a `webpki::TrustAnchor`, except it owns
@@ -17,37 +15,23 @@ pub struct OwnedTrustAnchor {
 }
 
 impl OwnedTrustAnchor {
-    /// Copy a `webpki::TrustAnchor` into owned memory
-    pub fn from_trust_anchor(t: &webpki::TrustAnchor) -> OwnedTrustAnchor {
-        OwnedTrustAnchor {
+    /// Get a `webpki::TrustAnchor` by borrowing the owned elements.
+    pub(crate) fn to_trust_anchor(&self) -> webpki::TrustAnchor {
+        webpki::TrustAnchor {
+            subject: &self.subject,
+            spki: &self.spki,
+            name_constraints: self.name_constraints.as_deref(),
+        }
+    }
+}
+
+impl From<&webpki::TrustAnchor<'_>> for OwnedTrustAnchor {
+    fn from(t: &webpki::TrustAnchor) -> Self {
+        Self {
             subject: t.subject.to_vec(),
             spki: t.spki.to_vec(),
             name_constraints: t.name_constraints.map(|x| x.to_vec()),
         }
-    }
-
-    /// Get a `webpki::TrustAnchor` by borrowing the owned elements.
-    pub fn to_trust_anchor(&self) -> webpki::TrustAnchor {
-        webpki::TrustAnchor {
-            subject: &self.subject,
-            spki: &self.spki,
-            name_constraints: self
-                .name_constraints
-                .as_ref()
-                .map(Vec::as_slice),
-        }
-    }
-}
-
-impl From<webpki::TrustAnchor<'_>> for OwnedTrustAnchor {
-    fn from(t: webpki::TrustAnchor) -> OwnedTrustAnchor {
-        Self::from_trust_anchor(&t)
-    }
-}
-
-impl<'a> Into<webpki::TrustAnchor<'a>> for &'a OwnedTrustAnchor {
-    fn into(self) -> webpki::TrustAnchor<'a> {
-        self.to_trust_anchor()
     }
 }
 
@@ -61,8 +45,8 @@ pub struct RootCertStore {
 
 impl RootCertStore {
     /// Make a new, empty `RootCertStore`.
-    pub fn empty() -> RootCertStore {
-        RootCertStore { roots: Vec::new() }
+    pub fn empty() -> Self {
+        Self { roots: Vec::new() }
     }
 
     /// Return true if there are no certificates.
@@ -76,7 +60,7 @@ impl RootCertStore {
     }
 
     /// Return the Subject Names for certificates in the container.
-    pub fn get_subjects(&self) -> DistinguishedNames {
+    pub fn subjects(&self) -> DistinguishedNames {
         let mut r = DistinguishedNames::new();
 
         for ota in &self.roots {
@@ -91,23 +75,21 @@ impl RootCertStore {
 
     /// Add a single DER-encoded certificate to the store.
     pub fn add(&mut self, der: &key::Certificate) -> Result<(), webpki::Error> {
-        let ta = webpki::trust_anchor_util::cert_der_as_trust_anchor(&der.0)?;
-
-        let ota = OwnedTrustAnchor::from_trust_anchor(&ta);
+        let ta = webpki::TrustAnchor::try_from_cert_der(&der.0)?;
+        let ota = OwnedTrustAnchor::from(&ta);
         self.roots.push(ota);
         Ok(())
     }
 
     /// Adds all the given TrustAnchors `anchors`.  This does not
     /// fail.
-    pub fn add_server_trust_anchors(
-        &mut self,
-        &webpki::TLSServerTrustAnchors(anchors): &webpki::TLSServerTrustAnchors,
-    ) {
-        for ta in anchors {
-            self.roots
-                .push(OwnedTrustAnchor::from_trust_anchor(ta));
-        }
+    pub fn add_server_trust_anchors<'a, I, T: 'a>(&mut self, iter: I)
+    where
+        I: IntoIterator<Item = &'a T> + 'a,
+        &'a T: Into<OwnedTrustAnchor>,
+    {
+        self.roots
+            .extend(iter.into_iter().map(|ta| ta.into()));
     }
 
     /// Parse the given DER-encoded certificates and add all that can be parsed
@@ -117,7 +99,7 @@ impl RootCertStore {
     /// include ancient or syntactically invalid certificates.
     ///
     /// Returns the number of certificates added, and the number that were ignored.
-    pub fn add_parsable_certificates(&mut self, der_certs: &Vec<Vec<u8>>) -> (usize, usize) {
+    pub fn add_parsable_certificates(&mut self, der_certs: &[Vec<u8>]) -> (usize, usize) {
         let mut valid_count = 0;
         let mut invalid_count = 0;
 

@@ -1,11 +1,12 @@
+use crate::client::ServerName;
 use crate::msgs::base::{PayloadU8, PayloadU16};
 use crate::msgs::codec::{Codec, Reader};
 use crate::msgs::enums::{CipherSuite, ProtocolVersion};
 use crate::msgs::handshake::CertificatePayload;
 use crate::msgs::handshake::SessionID;
+use crate::SupportedCipherSuite;
 
-use webpki;
-
+use crate::ticketer::TimeBase;
 use std::cmp;
 use std::mem;
 
@@ -17,35 +18,33 @@ use std::mem;
 #[derive(Debug)]
 pub struct ClientSessionKey {
     kind: &'static [u8],
-    dns_name: PayloadU8,
+    name: Vec<u8>,
 }
 
 impl Codec for ClientSessionKey {
     fn encode(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(self.kind);
-        self.dns_name.encode(bytes);
+        bytes.extend_from_slice(&self.name);
     }
 
     // Don't need to read these.
-    fn read(_r: &mut Reader) -> Option<ClientSessionKey> {
+    fn read(_r: &mut Reader) -> Option<Self> {
         None
     }
 }
 
 impl ClientSessionKey {
-    pub fn session_for_dns_name(dns_name: webpki::DNSNameRef) -> ClientSessionKey {
-        let dns_name_str: &str = dns_name.into();
-        ClientSessionKey {
+    pub fn session_for_server_name(server_name: &ServerName) -> Self {
+        Self {
             kind: b"session",
-            dns_name: PayloadU8::new(dns_name_str.as_bytes().to_vec()),
+            name: server_name.encode(),
         }
     }
 
-    pub fn hint_for_dns_name(dns_name: webpki::DNSNameRef) -> ClientSessionKey {
-        let dns_name_str: &str = dns_name.into();
-        ClientSessionKey {
+    pub fn hint_for_server_name(server_name: &ServerName) -> Self {
+        Self {
             kind: b"kx-hint",
-            dns_name: PayloadU8::new(dns_name_str.as_bytes().to_vec()),
+            name: server_name.encode(),
         }
     }
 }
@@ -53,8 +52,8 @@ impl ClientSessionKey {
 #[derive(Debug)]
 pub struct ClientSessionValue {
     pub version: ProtocolVersion,
-    pub cipher_suite: CipherSuite,
     pub session_id: SessionID,
+    cipher_suite: CipherSuite,
     pub ticket: PayloadU16,
     pub master_secret: PayloadU8,
     pub epoch: u64,
@@ -63,6 +62,24 @@ pub struct ClientSessionValue {
     pub extended_ms: bool,
     pub max_early_data_size: u32,
     pub server_cert_chain: CertificatePayload,
+}
+
+impl ClientSessionValue {
+    pub fn resolve_cipher_suite(
+        self,
+        enabled_cipher_suites: &[SupportedCipherSuite],
+        time: TimeBase,
+    ) -> Option<ClientSessionValueWithResolvedCipherSuite> {
+        let supported_cipher_suite = enabled_cipher_suites
+            .iter()
+            .copied()
+            .find(|scs| scs.suite() == self.cipher_suite)?;
+        Some(ClientSessionValueWithResolvedCipherSuite {
+            value: self,
+            supported_cipher_suite,
+            time_retrieved: time,
+        })
+    }
 }
 
 impl Codec for ClientSessionValue {
@@ -80,9 +97,9 @@ impl Codec for ClientSessionValue {
         self.server_cert_chain.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<ClientSessionValue> {
+    fn read(r: &mut Reader) -> Option<Self> {
         let v = ProtocolVersion::read(r)?;
-        let cs = CipherSuite::read(r)?;
+        let cipher_suite = CipherSuite::read(r)?;
         let sid = SessionID::read(r)?;
         let ticket = PayloadU16::read(r)?;
         let ms = PayloadU8::read(r)?;
@@ -93,9 +110,9 @@ impl Codec for ClientSessionValue {
         let max_early_data_size = u32::read(r)?;
         let server_cert_chain = CertificatePayload::read(r)?;
 
-        Some(ClientSessionValue {
+        Some(Self {
             version: v,
-            cipher_suite: cs,
+            cipher_suite,
             session_id: sid,
             ticket,
             master_secret: ms,
@@ -109,60 +126,95 @@ impl Codec for ClientSessionValue {
     }
 }
 
+#[derive(Debug)]
+pub struct ClientSessionValueWithResolvedCipherSuite {
+    value: ClientSessionValue,
+    supported_cipher_suite: SupportedCipherSuite,
+    time_retrieved: TimeBase,
+}
+
+impl std::ops::Deref for ClientSessionValueWithResolvedCipherSuite {
+    type Target = ClientSessionValue;
+    fn deref(&self) -> &Self::Target {
+        &self.value
+    }
+}
+
 static MAX_TICKET_LIFETIME: u32 = 7 * 24 * 60 * 60;
 
-impl ClientSessionValue {
+impl ClientSessionValueWithResolvedCipherSuite {
     pub fn new(
         v: ProtocolVersion,
-        cs: CipherSuite,
+        cipher_suite: SupportedCipherSuite,
         sessid: &SessionID,
         ticket: Vec<u8>,
         ms: Vec<u8>,
         server_cert_chain: &CertificatePayload,
-    ) -> ClientSessionValue {
-        ClientSessionValue {
-            version: v,
-            cipher_suite: cs,
-            session_id: *sessid,
-            ticket: PayloadU16::new(ticket),
-            master_secret: PayloadU8::new(ms),
-            epoch: 0,
-            lifetime: 0,
-            age_add: 0,
-            extended_ms: false,
-            max_early_data_size: 0,
-            server_cert_chain: server_cert_chain.clone(),
+        time_now: TimeBase,
+    ) -> Self {
+        Self {
+            value: ClientSessionValue {
+                version: v,
+                cipher_suite: cipher_suite.suite(),
+                session_id: *sessid,
+                ticket: PayloadU16::new(ticket),
+                master_secret: PayloadU8::new(ms),
+                epoch: 0,
+                lifetime: 0,
+                age_add: 0,
+                extended_ms: false,
+                max_early_data_size: 0,
+                server_cert_chain: server_cert_chain.to_owned(),
+            },
+            supported_cipher_suite: cipher_suite,
+            time_retrieved: time_now,
         }
     }
 
+    pub fn supported_cipher_suite(&self) -> SupportedCipherSuite {
+        self.supported_cipher_suite
+    }
+
+    pub fn set_session_id(&mut self, id: SessionID) {
+        self.value.session_id = id;
+    }
+
     pub fn set_extended_ms_used(&mut self) {
-        self.extended_ms = true;
+        self.value.extended_ms = true;
     }
 
-    pub fn set_times(&mut self, receipt_time_secs: u64, lifetime_secs: u32, age_add: u32) {
-        self.epoch = receipt_time_secs;
-        self.lifetime = cmp::min(lifetime_secs, MAX_TICKET_LIFETIME);
-        self.age_add = age_add;
+    pub fn set_times(&mut self, lifetime_secs: u32, age_add: u32) {
+        self.value.epoch = self.time_retrieved.as_secs();
+        self.value.lifetime = cmp::min(lifetime_secs, MAX_TICKET_LIFETIME);
+        self.value.age_add = age_add;
     }
 
-    pub fn has_expired(&self, time_now: u64) -> bool {
-        self.lifetime != 0 && self.epoch + u64::from(self.lifetime) < time_now
+    pub fn has_expired(&self) -> bool {
+        self.value.lifetime != 0
+            && self.value.epoch + u64::from(self.value.lifetime) < self.time_retrieved.as_secs()
     }
 
-    pub fn get_obfuscated_ticket_age(&self, time_now: u64) -> u32 {
-        let age_secs = time_now.saturating_sub(self.epoch);
+    pub fn get_obfuscated_ticket_age(&self, time_now: TimeBase) -> u32 {
+        let age_secs = time_now
+            .as_secs()
+            .saturating_sub(self.value.epoch);
         let age_millis = age_secs as u32 * 1000;
-        age_millis.wrapping_add(self.age_add)
+        age_millis.wrapping_add(self.value.age_add)
     }
 
     pub fn take_ticket(&mut self) -> Vec<u8> {
         let new_ticket = PayloadU16::new(Vec::new());
-        let old_ticket = mem::replace(&mut self.ticket, new_ticket);
+        let old_ticket = mem::replace(&mut self.value.ticket, new_ticket);
         old_ticket.0
     }
 
     pub fn set_max_early_data_size(&mut self, sz: u32) {
-        self.max_early_data_size = sz;
+        self.value.max_early_data_size = sz;
+    }
+
+    #[inline]
+    pub fn time_retrieved(&self) -> TimeBase {
+        self.time_retrieved
     }
 }
 
@@ -171,7 +223,7 @@ pub type ServerSessionKey = SessionID;
 
 #[derive(Debug)]
 pub struct ServerSessionValue {
-    pub sni: Option<webpki::DNSName>,
+    pub sni: Option<webpki::DnsName>,
     pub version: ProtocolVersion,
     pub cipher_suite: CipherSuite,
     pub master_secret: PayloadU8,
@@ -209,11 +261,11 @@ impl Codec for ServerSessionValue {
         self.application_data.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<ServerSessionValue> {
+    fn read(r: &mut Reader) -> Option<Self> {
         let has_sni = u8::read(r)?;
         let sni = if has_sni == 1 {
             let dns_name = PayloadU8::read(r)?;
-            let dns_name = webpki::DNSNameRef::try_from_ascii(&dns_name.0).ok()?;
+            let dns_name = webpki::DnsNameRef::try_from_ascii(&dns_name.0).ok()?;
             Some(dns_name.into())
         } else {
             None
@@ -236,7 +288,7 @@ impl Codec for ServerSessionValue {
         };
         let application_data = PayloadU16::read(r)?;
 
-        Some(ServerSessionValue {
+        Some(Self {
             sni,
             version: v,
             cipher_suite: cs,
@@ -251,15 +303,15 @@ impl Codec for ServerSessionValue {
 
 impl ServerSessionValue {
     pub fn new(
-        sni: Option<&webpki::DNSName>,
+        sni: Option<&webpki::DnsName>,
         v: ProtocolVersion,
         cs: CipherSuite,
         ms: Vec<u8>,
         cert_chain: &Option<CertificatePayload>,
         alpn: Option<Vec<u8>>,
         application_data: Vec<u8>,
-    ) -> ServerSessionValue {
-        ServerSessionValue {
+    ) -> Self {
+        Self {
             sni: sni.cloned(),
             version: v,
             cipher_suite: cs,

@@ -40,7 +40,7 @@ pub trait KeyLog: Send + Sync {
     ///   in a TLSv1.3 session.
     ///
     /// These strings are selected to match the NSS key log format:
-    /// https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format
+    /// <https://developer.mozilla.org/en-US/docs/Mozilla/Projects/NSS/Key_Log_Format>
     fn log(&self, label: &str, client_random: &[u8], secret: &[u8]);
 
     /// Indicates whether the secret with label `label` will be logged.
@@ -76,7 +76,7 @@ impl KeyLogFileInner {
             Ok(ref s) => Path::new(s),
             Err(env::VarError::NotUnicode(ref s)) => Path::new(s),
             Err(env::VarError::NotPresent) => {
-                return KeyLogFileInner {
+                return Self {
                     file: None,
                     buf: Vec::new(),
                 };
@@ -96,7 +96,7 @@ impl KeyLogFileInner {
             }
         };
 
-        KeyLogFileInner {
+        Self {
             file,
             buf: Vec::new(),
         }
@@ -139,7 +139,7 @@ impl KeyLogFile {
     /// inspected and the named file is opened during this call.
     pub fn new() -> Self {
         let var = env::var("SSLKEYLOGFILE");
-        KeyLogFile(Mutex::new(KeyLogFileInner::new(var)))
+        Self(Mutex::new(KeyLogFileInner::new(var)))
     }
 }
 

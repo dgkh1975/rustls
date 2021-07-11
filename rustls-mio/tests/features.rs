@@ -61,12 +61,13 @@ fn alpn_agree() {
         .http_mode()
         .run();
 
-    // Like openssl we don't fail a handshake for no ALPN overlap.
+    // We fail a handshake for no ALPN overlap.
     server
         .client()
         .arg("-alpn")
         .arg("coburn")
-        .expect("No ALPN negotiated")
+        .expect_log("SSL alert number 120")
+        .fails()
         .go();
 
     server
@@ -459,7 +460,7 @@ fn recv_low_mtu() {
 }
 
 #[test]
-fn send_low_mtu() {
+fn send_small_fragments() {
     let test_ca = common::new_test_ca();
 
     let mut server = OpenSSLServer::new_rsa(test_ca.path(), 9110);
@@ -467,7 +468,7 @@ fn send_low_mtu() {
 
     server
         .client()
-        .mtu(128)
+        .max_fragment_size(128)
         .expect("Ciphers common between both SSL end points")
         .go();
 }
