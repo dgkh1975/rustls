@@ -1,219 +1,318 @@
-use crate::rand;
-use crate::server::ProducesTickets;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::mem;
+use core::time::Duration;
+use std::sync::{RwLock, RwLockReadGuard};
+use std::time::Instant;
 
-use ring::aead;
-use std::mem;
-use std::sync::{Arc, Mutex};
-use std::time;
-
-/// The timebase for expiring and rolling tickets and ticketing
-/// keys.  This is UNIX wall time in seconds.
-pub fn timebase() -> u64 {
-    time::SystemTime::now()
-        .duration_since(time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs()
-}
-
-/// This is a `ProducesTickets` implementation which uses
-/// any *ring* `aead::Algorithm` to encrypt and authentication
-/// the ticket payload.  It does not enforce any lifetime
-/// constraint.
-pub struct AEADTicketer {
-    alg: &'static aead::Algorithm,
-    key: aead::LessSafeKey,
-    lifetime: u32,
-}
-
-impl AEADTicketer {
-    /// Make a new `AEADTicketer` using the given `alg`, `key` material
-    /// and advertised `lifetime_seconds`.  Note that `lifetime_seconds`
-    /// does not affect the lifetime of the key.  `key` must be the
-    /// right length for `alg` or this will panic.
-    pub fn new_custom(
-        alg: &'static aead::Algorithm,
-        key: &[u8],
-        lifetime_seconds: u32,
-    ) -> AEADTicketer {
-        let key = aead::UnboundKey::new(alg, key).unwrap();
-        AEADTicketer {
-            alg,
-            key: aead::LessSafeKey::new(key),
-            lifetime: lifetime_seconds,
-        }
-    }
-
-    /// Make a ticketer with recommended configuration and a random key.
-    pub fn new() -> AEADTicketer {
-        let mut key = [0u8; 32];
-        rand::fill_random(&mut key);
-        AEADTicketer::new_custom(&aead::CHACHA20_POLY1305, &key, 60 * 60 * 12)
-    }
-}
-
-impl ProducesTickets for AEADTicketer {
-    fn enabled(&self) -> bool {
-        true
-    }
-    fn get_lifetime(&self) -> u32 {
-        self.lifetime
-    }
-
-    /// Encrypt `message` and return the ciphertext.
-    fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
-        // Random nonce, because a counter is a privacy leak.
-        let mut nonce_buf = [0u8; 12];
-        rand::fill_random(&mut nonce_buf);
-        let nonce = ring::aead::Nonce::assume_unique_for_key(nonce_buf);
-        let aad = ring::aead::Aad::empty();
-
-        let mut ciphertext =
-            Vec::with_capacity(nonce_buf.len() + message.len() + self.key.algorithm().tag_len());
-        ciphertext.extend(&nonce_buf);
-        ciphertext.extend(message);
-        self.key
-            .seal_in_place_separate_tag(nonce, aad, &mut ciphertext[nonce_buf.len()..])
-            .map(|tag| {
-                ciphertext.extend(tag.as_ref());
-                ciphertext
-            })
-            .ok()
-    }
-
-    /// Decrypt `ciphertext` and recover the original message.
-    fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        let nonce_len = self.alg.nonce_len();
-        let tag_len = self.alg.tag_len();
-
-        if ciphertext.len() < nonce_len + tag_len {
-            return None;
-        }
-
-        let nonce =
-            ring::aead::Nonce::try_assume_unique_for_key(&ciphertext[0..nonce_len]).unwrap();
-        let aad = ring::aead::Aad::empty();
-
-        let mut out = Vec::new();
-        out.extend_from_slice(&ciphertext[nonce_len..]);
-
-        let plain_len = match self
-            .key
-            .open_in_place(nonce, aad, &mut out)
-        {
-            Ok(plaintext) => plaintext.len(),
-            Err(..) => {
-                return None;
-            }
-        };
-
-        out.truncate(plain_len);
-        Some(out)
-    }
-}
-
-struct TicketSwitcherState {
-    current: Box<dyn ProducesTickets>,
-    previous: Option<Box<dyn ProducesTickets>>,
-    next_switch_time: u64,
-}
+use crate::crypto::TicketProducer;
+use crate::error::Error;
 
 /// A ticketer that has a 'current' sub-ticketer and a single
 /// 'previous' ticketer.  It creates a new ticketer every so
 /// often, demoting the current ticketer.
-pub struct TicketSwitcher {
-    generator: fn() -> Box<dyn ProducesTickets>,
-    lifetime: u32,
-    state: Mutex<TicketSwitcherState>,
+pub struct TicketRotator {
+    pub(crate) generator: fn() -> Result<Box<dyn TicketProducer>, Error>,
+    lifetime: Duration,
+    state: RwLock<TicketRotatorState>,
 }
 
-impl TicketSwitcher {
-    /// `lifetime` is in seconds, and is how long the current ticketer
+impl TicketRotator {
+    /// Creates a new `TicketRotator`, which rotates through sub-ticketers
+    /// based on the passage of time.
+    ///
+    /// `lifetime` is how long the current ticketer
     /// is used to generate new tickets.  Tickets are accepted for no
-    /// longer than twice this duration.  `generator` produces a new
-    /// `ProducesTickets` implementation.
-    pub fn new(lifetime: u32, generator: fn() -> Box<dyn ProducesTickets>) -> TicketSwitcher {
-        TicketSwitcher {
+    /// longer than twice this duration.  This means a given ticket will
+    /// be usable for at least one `lifetime`, and at most two `lifetime`s
+    /// (depending on when its creation falls in the replacement cycle.)
+    ///
+    /// `generator` produces a new [`TicketProducer`] implementation.
+    pub fn new(
+        lifetime: Duration,
+        generator: fn() -> Result<Box<dyn TicketProducer>, Error>,
+    ) -> Result<Self, Error> {
+        Ok(Self {
             generator,
             lifetime,
-            state: Mutex::new(TicketSwitcherState {
-                current: generator(),
+            state: RwLock::new(TicketRotatorState {
+                current: Some(Generation {
+                    producer: generator()?,
+                    expires_at: Instant::now() + lifetime,
+                }),
                 previous: None,
-                next_switch_time: timebase() + u64::from(lifetime),
             }),
+        })
+    }
+
+    fn encrypt_at(&self, message: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let state = self.maybe_roll(now)?;
+
+        // If we have a current ticketer, use it. We don't need to check its
+        // expiration time; if it would have expired, we would have rolled above.
+        if let Some(current) = &state.current {
+            return current.producer.encrypt(message);
         }
+
+        // If we don't have a previous ticketer, we can't encrypt.
+        let Some(prev) = &state.previous else {
+            return None;
+        };
+
+        // If the previous ticketer is more than one `lifetime` old, decline to encrypt.
+        if !prev.in_grace_period(now, self.lifetime) {
+            return None;
+        }
+
+        prev.producer.encrypt(message)
+    }
+
+    fn decrypt_at(&self, ciphertext: &[u8], now: Instant) -> Option<Vec<u8>> {
+        let state = self.maybe_roll(now)?;
+
+        // If we have a current ticketer, use it. We don't need to check its
+        // expiration time; if it would have expired, we would have rolled above.
+        if let Some(current) = &state.current {
+            // If decryption fails, we're going to try the previous ticketer below.
+            if let Some(plain) = current.producer.decrypt(ciphertext) {
+                return Some(plain);
+            }
+        }
+
+        // If we don't have a previous ticketer, we can't decrypt.
+        let Some(prev) = &state.previous else {
+            return None;
+        };
+
+        // If the previous ticketer is more than one `lifetime` old, decline to decrypt.
+        if !prev.in_grace_period(now, self.lifetime) {
+            return None;
+        }
+
+        prev.producer.decrypt(ciphertext)
     }
 
     /// If it's time, demote the `current` ticketer to `previous` (so it
-    /// does no new encryptions but can do decryption) and make a fresh
-    /// `current` ticketer.
+    /// does no new encryptions but can do decryption) and replace it
+    /// with a new one.
     ///
     /// Calling this regularly will ensure timely key erasure.  Otherwise,
     /// key erasure will be delayed until the next encrypt/decrypt call.
-    pub fn maybe_roll(&self) {
-        let mut state = self.state.lock().unwrap();
-        let now = timebase();
-
-        if now > state.next_switch_time {
-            state.previous = Some(mem::replace(&mut state.current, (self.generator)()));
-            state.next_switch_time = now + u64::from(self.lifetime);
+    ///
+    /// For efficiency, this is also responsible for locking the state rwlock
+    /// and returning it for read.
+    pub(crate) fn maybe_roll(
+        &self,
+        now: Instant,
+    ) -> Option<RwLockReadGuard<'_, TicketRotatorState>> {
+        // Fast, common, & read-only path in case we do not need to switch
+        // to the next ticketer yet
+        {
+            let read = self.state.read().ok()?;
+            match &read.current {
+                Some(current) if now <= current.expires_at => return Some(read),
+                _ => {}
+            }
         }
+
+        let mut write = self.state.write().ok()?;
+        if let Some(current) = &write.current {
+            if now <= current.expires_at {
+                // Another thread beat us to it. Nothing to do.
+                drop(write);
+                return self.state.read().ok();
+            }
+        }
+
+        // We need to switch ticketers, and make a new one.
+        // Generate a potential "next" ticketer outside the lock.
+        let next = (self.generator)()
+            .ok()
+            .map(|producer| Generation {
+                producer,
+                expires_at: now + self.lifetime,
+            });
+
+        // Now we have:
+        // - confirmed we need rotation
+        // - confirmed we are the thread that will do it
+        // - successfully made the replacement ticketer
+        let prev = mem::replace(&mut write.current, next);
+        if prev.is_some() {
+            write.previous = prev;
+        }
+        drop(write);
+
+        self.state.read().ok()
     }
 }
 
-impl ProducesTickets for TicketSwitcher {
-    fn get_lifetime(&self) -> u32 {
-        self.lifetime * 2
-    }
-
-    fn enabled(&self) -> bool {
-        true
-    }
-
+impl TicketProducer for TicketRotator {
     fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
-        self.maybe_roll();
-
-        self.state
-            .lock()
-            .unwrap()
-            .current
-            .encrypt(message)
+        self.encrypt_at(message, Instant::now())
     }
 
     fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
-        self.maybe_roll();
+        self.decrypt_at(ciphertext, Instant::now())
+    }
 
-        // Decrypt with the current key; if that fails, try with the previous.
-        let state = self.state.lock().unwrap();
-        state.current.decrypt(ciphertext)
-            .or_else(|| {
-                state.previous.as_ref()
-                    .and_then(|previous| previous.decrypt(ciphertext))
-            })
+    fn lifetime(&self) -> Duration {
+        self.lifetime
     }
 }
 
-/// A concrete, safe ticket creation mechanism.
-pub struct Ticketer {}
-
-fn generate_inner() -> Box<dyn ProducesTickets> {
-    Box::new(AEADTicketer::new())
-}
-
-impl Ticketer {
-    /// Make the recommended Ticketer.  This produces tickets
-    /// with a 12 hour life and randomly generated keys.
-    ///
-    /// The encryption mechanism used in Chacha20Poly1305.
-    pub fn new() -> Arc<dyn ProducesTickets> {
-        Arc::new(TicketSwitcher::new(6 * 60 * 60, generate_inner))
+impl core::fmt::Debug for TicketRotator {
+    fn fmt(&self, f: &mut core::fmt::Formatter<'_>) -> core::fmt::Result {
+        f.debug_struct("TicketRotator")
+            .finish_non_exhaustive()
     }
 }
 
-#[test]
-fn basic_pairwise_test() {
-    let t = Ticketer::new();
-    assert_eq!(true, t.enabled());
-    let cipher = t.encrypt(b"hello world").unwrap();
-    let plain = t.decrypt(&cipher).unwrap();
-    assert_eq!(plain, b"hello world");
+pub(crate) struct TicketRotatorState {
+    current: Option<Generation>,
+    previous: Option<Generation>,
+}
+
+struct Generation {
+    producer: Box<dyn TicketProducer>,
+    expires_at: Instant,
+}
+
+impl Generation {
+    fn in_grace_period(&self, now: Instant, lifetime: Duration) -> bool {
+        now <= self.expires_at + lifetime
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use core::sync::atomic::{AtomicU8, Ordering};
+    use core::time::Duration;
+
+    use super::*;
+
+    #[test]
+    fn ticketrotator_switching_test() {
+        let t = TicketRotator::new(Duration::from_secs(1), FakeTicketer::new).unwrap();
+        let now = Instant::now();
+        let cipher1 = t.encrypt(b"ticket 1").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        {
+            // Trigger new ticketer
+            t.maybe_roll(now + Duration::from_secs(10));
+        }
+        let cipher2 = t.encrypt(b"ticket 2").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+        {
+            // Trigger new ticketer
+            t.maybe_roll(now + Duration::from_secs(20));
+        }
+        let cipher3 = t.encrypt(b"ticket 3").unwrap();
+        assert!(t.decrypt(&cipher1).is_none());
+        assert_eq!(t.decrypt(&cipher2).unwrap(), b"ticket 2");
+        assert_eq!(t.decrypt(&cipher3).unwrap(), b"ticket 3");
+    }
+
+    #[test]
+    fn ticketrotator_remains_usable_over_temporary_ticketer_creation_failure() {
+        let mut t = TicketRotator::new(Duration::from_secs(1), FakeTicketer::new).unwrap();
+        let expiry = t
+            .state
+            .read()
+            .unwrap()
+            .current
+            .as_ref()
+            .unwrap()
+            .expires_at;
+        let cipher1 = t.encrypt(b"ticket 1").unwrap();
+        assert_eq!(t.decrypt(&cipher1).unwrap(), b"ticket 1");
+        t.generator = fail_generator;
+
+        // Failed new ticketer; this means we still need to rotate.
+        let t1 = expiry;
+        drop(t.maybe_roll(t1));
+        assert!(t.encrypt_at(b"ticket 2", t1).is_some());
+
+        // check post-failure encryption/decryption still works
+        let t2 = expiry + Duration::from_secs(1);
+        let cipher3 = t.encrypt_at(b"ticket 3", t2).unwrap();
+        assert_eq!(t.decrypt_at(&cipher1, t2).unwrap(), b"ticket 1");
+        assert_eq!(t.decrypt_at(&cipher3, t2).unwrap(), b"ticket 3");
+
+        let t3 = expiry + Duration::from_secs(2);
+        assert_eq!(t.encrypt_at(b"ticket 4", t3), None);
+        assert_eq!(t.decrypt_at(&cipher3, t3), None);
+
+        // do the rotation for real
+        t.generator = FakeTicketer::new;
+        let t4 = expiry + Duration::from_secs(3);
+        drop(t.maybe_roll(t4));
+
+        let t5 = expiry + Duration::from_secs(4);
+        let cipher5 = t.encrypt_at(b"ticket 5", t5).unwrap();
+        assert!(t.decrypt_at(&cipher1, t5).is_none());
+        assert!(t.decrypt_at(&cipher3, t5).is_none());
+        assert_eq!(t.decrypt_at(&cipher5, t5).unwrap(), b"ticket 5");
+
+        // Cover the case where both ticketers are unavailable
+        t.generator = fail_generator;
+        let mut write = t.state.write().unwrap();
+        write.current = None;
+        write.previous = None;
+        drop(write);
+        assert!(t.encrypt(b"ticket 6").is_none());
+    }
+
+    #[derive(Debug)]
+    struct FakeTicketer {
+        generation: u8,
+    }
+
+    impl FakeTicketer {
+        #[expect(clippy::new_ret_no_self)]
+        fn new() -> Result<Box<dyn TicketProducer>, Error> {
+            Ok(Box::new(Self {
+                generation: std::dbg!(FAKE_GEN.fetch_add(1, Ordering::SeqCst)),
+            }))
+        }
+    }
+
+    impl TicketProducer for FakeTicketer {
+        fn encrypt(&self, message: &[u8]) -> Option<Vec<u8>> {
+            let mut v = Vec::with_capacity(1 + message.len());
+            v.push(self.generation);
+            v.extend(
+                message
+                    .iter()
+                    .copied()
+                    .map(|b| b ^ self.generation),
+            );
+            Some(v)
+        }
+
+        fn decrypt(&self, ciphertext: &[u8]) -> Option<Vec<u8>> {
+            if ciphertext.first()? != &self.generation {
+                return None;
+            }
+
+            Some(
+                ciphertext[1..]
+                    .iter()
+                    .copied()
+                    .map(|b| b ^ self.generation)
+                    .collect(),
+            )
+        }
+
+        fn lifetime(&self) -> Duration {
+            Duration::ZERO // Left to the rotator
+        }
+    }
+
+    static FAKE_GEN: AtomicU8 = AtomicU8::new(0);
+
+    fn fail_generator() -> Result<Box<dyn TicketProducer>, Error> {
+        Err(Error::FailedToGetRandomBytes)
+    }
 }

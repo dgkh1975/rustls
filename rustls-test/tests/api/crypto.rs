@@ -1,0 +1,1211 @@
+//! Cryptography-related tests, and tests around key material handling.
+
+#![allow(clippy::disallowed_types, clippy::duplicate_mod)]
+
+use std::borrow::Cow;
+use std::io::Cursor;
+use std::sync::{Arc, Mutex};
+
+use rustls::client::Resumption;
+use rustls::crypto::cipher::{AeadKey, EncodableVersion, InboundOpaque, Iv, Payload, Record};
+use rustls::crypto::tls13::{HkdfExpander, OkmBlock, expand};
+use rustls::crypto::{Credentials, CryptoProvider};
+use rustls::enums::{ContentType, HandshakeType, ProtocolVersion};
+use rustls::error::{ApiMisuse, PeerMisbehaved};
+use rustls::{
+    ClientConfig, ClientSide, Connection, ConnectionTrafficSecrets, Error, KeyLog, ServerConfig,
+    ServerSide, SideData, SupportedCipherSuite, Tcp, Tls13CipherSuite, VecInput,
+};
+use rustls_test::{
+    ClientConfigExt, ClientStorage, ErrorFromPeer, KeyType, MultiTest, RawTls, ServerConfigExt,
+    aes_128_gcm_with_1024_confidentiality_limit, encoding, make_client_config, make_pair,
+    make_pair_for_arc_configs, make_pair_for_configs, make_server_config, provider_with_one_suite,
+    transfer,
+};
+
+use super::provider;
+use super::provider::cipher_suite;
+
+#[test]
+fn key_log_for_tls12() {
+    let client_key_log = Arc::new(KeyLogToVec::new("client"));
+    let server_key_log = Arc::new(KeyLogToVec::new("server"));
+
+    let provider = provider::DEFAULT_TLS12_PROVIDER;
+    let kt = KeyType::default();
+    let mut client_config = make_client_config(kt, &provider);
+    client_config.key_log = client_key_log.clone();
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.key_log = server_key_log.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let client_full_log = client_key_log.take();
+    let server_full_log = server_key_log.take();
+    assert_eq!(client_full_log, server_full_log);
+    assert_eq!(1, client_full_log.len());
+    assert_eq!("CLIENT_RANDOM", client_full_log[0].label);
+
+    // resumed
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let client_resume_log = client_key_log.take();
+    let server_resume_log = server_key_log.take();
+    assert_eq!(client_resume_log, server_resume_log);
+    assert_eq!(1, client_resume_log.len());
+    assert_eq!("CLIENT_RANDOM", client_resume_log[0].label);
+    assert_eq!(client_full_log[0].secret, client_resume_log[0].secret);
+}
+
+#[test]
+fn key_log_for_tls13() {
+    let client_key_log = Arc::new(KeyLogToVec::new("client"));
+    let server_key_log = Arc::new(KeyLogToVec::new("server"));
+
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let kt = KeyType::default();
+    let mut client_config = make_client_config(kt, &provider);
+    client_config.key_log = client_key_log.clone();
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.key_log = server_key_log.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let client_full_log = client_key_log.take();
+    let server_full_log = server_key_log.take();
+
+    assert_eq!(5, client_full_log.len());
+    assert_eq!("CLIENT_HANDSHAKE_TRAFFIC_SECRET", client_full_log[0].label);
+    assert_eq!("SERVER_HANDSHAKE_TRAFFIC_SECRET", client_full_log[1].label);
+    assert_eq!("CLIENT_TRAFFIC_SECRET_0", client_full_log[2].label);
+    assert_eq!("SERVER_TRAFFIC_SECRET_0", client_full_log[3].label);
+    assert_eq!("EXPORTER_SECRET", client_full_log[4].label);
+
+    assert_eq!(client_full_log[0], server_full_log[0]);
+    assert_eq!(client_full_log[1], server_full_log[1]);
+    assert_eq!(client_full_log[2], server_full_log[2]);
+    assert_eq!(client_full_log[3], server_full_log[3]);
+    assert_eq!(client_full_log[4], server_full_log[4]);
+
+    // resumed
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let client_resume_log = client_key_log.take();
+    let server_resume_log = server_key_log.take();
+
+    assert_eq!(5, client_resume_log.len());
+    assert_eq!(
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        client_resume_log[0].label
+    );
+    assert_eq!(
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        client_resume_log[1].label
+    );
+    assert_eq!("CLIENT_TRAFFIC_SECRET_0", client_resume_log[2].label);
+    assert_eq!("SERVER_TRAFFIC_SECRET_0", client_resume_log[3].label);
+    assert_eq!("EXPORTER_SECRET", client_resume_log[4].label);
+
+    assert_eq!(6, server_resume_log.len());
+    assert_eq!("CLIENT_EARLY_TRAFFIC_SECRET", server_resume_log[0].label);
+    assert_eq!(
+        "CLIENT_HANDSHAKE_TRAFFIC_SECRET",
+        server_resume_log[1].label
+    );
+    assert_eq!(
+        "SERVER_HANDSHAKE_TRAFFIC_SECRET",
+        server_resume_log[2].label
+    );
+    assert_eq!("CLIENT_TRAFFIC_SECRET_0", server_resume_log[3].label);
+    assert_eq!("SERVER_TRAFFIC_SECRET_0", server_resume_log[4].label);
+    assert_eq!("EXPORTER_SECRET", server_resume_log[5].label);
+
+    assert_eq!(client_resume_log[0], server_resume_log[1]);
+    assert_eq!(client_resume_log[1], server_resume_log[2]);
+    assert_eq!(client_resume_log[2], server_resume_log[3]);
+    assert_eq!(client_resume_log[3], server_resume_log[4]);
+    assert_eq!(client_resume_log[4], server_resume_log[5]);
+}
+#[derive(Debug)]
+struct KeyLogToVec {
+    label: &'static str,
+    items: Mutex<Vec<KeyLogItem>>,
+}
+
+impl KeyLogToVec {
+    fn new(who: &'static str) -> Self {
+        Self {
+            label: who,
+            items: Mutex::new(vec![]),
+        }
+    }
+
+    fn take(&self) -> Vec<KeyLogItem> {
+        core::mem::take(&mut self.items.lock().unwrap())
+    }
+}
+
+impl KeyLog for KeyLogToVec {
+    fn log(&self, label: &str, client: &[u8], secret: &[u8]) {
+        let value = KeyLogItem {
+            label: label.into(),
+            client_random: client.into(),
+            secret: secret.into(),
+        };
+
+        println!("key log {:?}: {:?}", self.label, value);
+
+        self.items.lock().unwrap().push(value);
+    }
+}
+
+#[derive(Debug, PartialEq)]
+struct KeyLogItem {
+    label: String,
+    client_random: Vec<u8>,
+    secret: Vec<u8>,
+}
+
+/// Test that secrets can be extracted and used for encryption/decryption.
+#[test]
+fn test_secret_extraction_enabled() {
+    // Normally, secret extraction would be used to configure kTLS (TLS offload
+    // to the kernel). We want this test to run on any platform, though, so
+    // instead we just compare secrets for equality.
+
+    // TLS 1.2 and 1.3 have different mechanisms for key exchange and handshake,
+    // and secrets are stored/extracted differently, so we want to test them both.
+    // We support 3 different AEAD algorithms (AES-128-GCM mode, AES-256-GCM, and
+    // Chacha20Poly1305), so that's 2*3 = 6 combinations to test.
+    let kt = KeyType::Rsa2048;
+    let provider = provider::DEFAULT_PROVIDER;
+    for suite in [
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_128_GCM_SHA256),
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_256_GCM_SHA384),
+        #[cfg(not(feature = "fips"))]
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_CHACHA20_POLY1305_SHA256),
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+        #[cfg(not(feature = "fips"))]
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256),
+    ] {
+        println!("Testing suite {:?}", suite.suite());
+
+        // Only offer the cipher suite (and protocol version) that we're testing
+        let mut server_config =
+            ServerConfig::builder(provider_with_one_suite(&provider, suite).into())
+                .with_no_client_auth()
+                .with_single_cert(kt.identity(), kt.key())
+                .unwrap();
+        // Opt into secret extraction from both sides
+        server_config.enable_secret_extraction = true;
+        let server_config = Arc::new(server_config);
+
+        let mut client_config = make_client_config(kt, &provider);
+        client_config.enable_secret_extraction = true;
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+
+        buf.handshake(&mut client, &mut server);
+
+        // The handshake is finished, we're now able to extract traffic secrets
+        let client_secrets = client
+            .dangerous_extract_secrets()
+            .unwrap();
+        let server_secrets = server
+            .dangerous_extract_secrets()
+            .unwrap();
+
+        // Comparing secrets for equality is something you should never have to
+        // do in production code, so ConnectionTrafficSecrets doesn't implement
+        // PartialEq/Eq on purpose. Instead, we have to get creative.
+        fn explode_secrets(s: &ConnectionTrafficSecrets) -> (&[u8], &[u8]) {
+            match s {
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+                ConnectionTrafficSecrets::Aes256Gcm { key, iv } => (key.as_ref(), iv.as_ref()),
+                ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv } => {
+                    (key.as_ref(), iv.as_ref())
+                }
+                _ => panic!("unexpected secret type"),
+            }
+        }
+
+        fn assert_secrets_equal(
+            (l_seq, l_sec): (u64, ConnectionTrafficSecrets),
+            (r_seq, r_sec): (u64, ConnectionTrafficSecrets),
+        ) {
+            assert_eq!(l_seq, r_seq);
+            assert_eq!(explode_secrets(&l_sec), explode_secrets(&r_sec));
+        }
+
+        assert_secrets_equal(client_secrets.tx, server_secrets.rx);
+        assert_secrets_equal(client_secrets.rx, server_secrets.tx);
+    }
+}
+
+#[test]
+fn test_secret_extract_produces_correct_variant() {
+    fn check(suite: SupportedCipherSuite, f: impl Fn(ConnectionTrafficSecrets) -> bool) {
+        let kt = KeyType::Rsa2048;
+
+        let provider: Arc<CryptoProvider> =
+            provider_with_one_suite(&provider::DEFAULT_PROVIDER, suite).into();
+
+        let mut server_config = ServerConfig::builder(provider.clone()).finish(kt);
+
+        server_config.enable_secret_extraction = true;
+        let server_config = Arc::new(server_config);
+
+        let mut client_config = ClientConfig::builder(provider).finish(kt);
+        client_config.enable_secret_extraction = true;
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&Arc::new(client_config), &server_config);
+
+        buf.handshake(&mut client, &mut server);
+
+        let client_secrets = client
+            .dangerous_extract_secrets()
+            .unwrap();
+        let server_secrets = server
+            .dangerous_extract_secrets()
+            .unwrap();
+
+        assert!(f(client_secrets.tx.1));
+        assert!(f(client_secrets.rx.1));
+        assert!(f(server_secrets.tx.1));
+        assert!(f(server_secrets.rx.1));
+    }
+
+    check(
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_128_GCM_SHA256),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Aes128Gcm { .. }),
+    );
+    check(
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_AES_256_GCM_SHA384),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Aes256Gcm { .. }),
+    );
+    check(
+        SupportedCipherSuite::Tls13(cipher_suite::TLS13_CHACHA20_POLY1305_SHA256),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Chacha20Poly1305 { .. }),
+    );
+
+    check(
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Aes128Gcm { .. }),
+    );
+    check(
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Aes256Gcm { .. }),
+    );
+    check(
+        SupportedCipherSuite::Tls12(cipher_suite::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256),
+        |sec| matches!(sec, ConnectionTrafficSecrets::Chacha20Poly1305 { .. }),
+    );
+}
+
+/// Test that secrets cannot be extracted unless explicitly enabled, and until
+/// the handshake is done.
+#[test]
+fn test_secret_extraction_disabled_or_too_early() {
+    let kt = KeyType::default();
+    let provider = Arc::new(CryptoProvider {
+        tls13_cipher_suites: Cow::Owned(vec![cipher_suite::TLS13_AES_128_GCM_SHA256]),
+        ..provider::DEFAULT_PROVIDER
+    });
+
+    for (server_enable, client_enable) in [(true, false), (false, true)] {
+        let mut server_config = ServerConfig::builder(provider.clone())
+            .with_no_client_auth()
+            .with_single_cert(kt.identity(), kt.key())
+            .unwrap();
+        server_config.enable_secret_extraction = server_enable;
+        let server_config = Arc::new(server_config);
+
+        let mut client_config = make_client_config(kt, &provider);
+        client_config.enable_secret_extraction = client_enable;
+
+        let client_config = Arc::new(client_config);
+
+        let (client, server, _) = make_pair_for_arc_configs(&client_config, &server_config);
+
+        assert_eq!(
+            client.dangerous_extract_secrets().err(),
+            Some(Error::HandshakeNotComplete),
+            "extraction should fail until handshake completes"
+        );
+        assert_eq!(
+            server.dangerous_extract_secrets().err(),
+            Some(Error::HandshakeNotComplete),
+            "extraction should fail until handshake completes"
+        );
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&client_config, &server_config);
+
+        buf.handshake(&mut client, &mut server);
+
+        assert_eq!(
+            server_enable,
+            server
+                .dangerous_extract_secrets()
+                .is_ok()
+        );
+        assert_eq!(
+            client_enable,
+            client
+                .dangerous_extract_secrets()
+                .is_ok()
+        );
+    }
+}
+
+#[test]
+fn test_secret_extraction_fails_with_pending_send_data() {
+    fn server_with_queued_key_update() -> Connection<ServerSide, Tcp> {
+        let mut server_config = make_server_config(KeyType::default(), &provider::DEFAULT_PROVIDER);
+        server_config.enable_secret_extraction = true;
+
+        let (mut client, mut server, mut buf) = make_pair_for_configs(
+            make_client_config(KeyType::default(), &provider::DEFAULT_PROVIDER),
+            server_config,
+        );
+        buf.handshake(&mut client, &mut server);
+
+        // receiving the key-update request queues an encrypted response on the
+        // server's send path, awaiting the next write
+        client
+            .refresh_traffic_keys(&mut buf.client_output)
+            .unwrap();
+        transfer(&mut buf.client_output, &mut buf.server_input);
+        server
+            .read_tls(&mut buf.server_input, &mut buf.server_output)
+            .handle_all(&mut Vec::new())
+            .unwrap();
+        server
+    }
+
+    // extracting now is refused: the queued response would be discarded,
+    // having already consumed a send sequence number
+    assert_eq!(
+        server_with_queued_key_update()
+            .dangerous_extract_secrets()
+            .err(),
+        Some(ApiMisuse::KernelConnectionWithPendingSendData.into())
+    );
+
+    // writing out the pending data first makes extraction possible
+    let mut server = server_with_queued_key_update();
+    let mut server_output = Vec::new();
+    server
+        .write(b"flush".into(), &mut server_output)
+        .unwrap();
+    server
+        .dangerous_extract_secrets()
+        .unwrap();
+}
+
+#[test]
+fn test_refresh_traffic_keys_during_handshake() {
+    let mut server_output = Vec::new();
+    let (mut client, mut server, mut buf) =
+        make_pair(KeyType::default(), &provider::DEFAULT_PROVIDER);
+    assert_eq!(
+        client
+            .refresh_traffic_keys(&mut buf.client_output)
+            .unwrap_err(),
+        Error::HandshakeNotComplete
+    );
+    assert_eq!(
+        server
+            .refresh_traffic_keys(&mut server_output)
+            .unwrap_err(),
+        Error::HandshakeNotComplete
+    );
+}
+
+#[test]
+fn test_refresh_traffic_keys() {
+    let (mut client, mut server, mut buf) =
+        make_pair(KeyType::default(), &provider::DEFAULT_PROVIDER);
+    buf.handshake(&mut client, &mut server);
+
+    fn check_both_directions(
+        client_input: &mut VecInput,
+        client_output: &mut Vec<u8>,
+        client: &mut Connection<ClientSide, Tcp>,
+        server_input: &mut VecInput,
+        server_output: &mut Vec<u8>,
+        server: &mut Connection<ServerSide, Tcp>,
+    ) {
+        client
+            .write(b"to-server-1".into(), client_output)
+            .unwrap();
+        server
+            .write(b"to-client-1".into(), server_output)
+            .unwrap();
+        transfer(client_output, server_input);
+        let server_iter = server.read_tls(server_input, server_output);
+
+        let mut buf = Vec::with_capacity(16);
+        server_iter
+            .handle_all(&mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"to-server-1");
+
+        transfer(server_output, client_input);
+        let client_iter = client.read_tls(client_input, client_output);
+
+        let mut buf = Vec::with_capacity(16);
+        client_iter
+            .handle_all(&mut buf)
+            .unwrap();
+        assert_eq!(&buf, b"to-client-1");
+    }
+
+    check_both_directions(
+        &mut buf.client_input,
+        &mut buf.client_output,
+        &mut client,
+        &mut buf.server_input,
+        &mut buf.server_output,
+        &mut server,
+    );
+    client
+        .refresh_traffic_keys(&mut buf.client_output)
+        .unwrap();
+    check_both_directions(
+        &mut buf.client_input,
+        &mut buf.client_output,
+        &mut client,
+        &mut buf.server_input,
+        &mut buf.server_output,
+        &mut server,
+    );
+    server
+        .refresh_traffic_keys(&mut buf.server_output)
+        .unwrap();
+    check_both_directions(
+        &mut buf.client_input,
+        &mut buf.client_output,
+        &mut client,
+        &mut buf.server_input,
+        &mut buf.server_output,
+        &mut server,
+    );
+}
+
+#[test]
+fn test_refresh_traffic_keys_is_idempotent() {
+    let (mut client, mut server, mut buf) =
+        make_pair(KeyType::default(), &provider::DEFAULT_PROVIDER);
+    buf.handshake(&mut client, &mut server);
+    test(
+        &mut buf.client_input,
+        &mut buf.client_output,
+        &mut client,
+        &mut buf.server_input,
+        &mut buf.server_output,
+        &mut server,
+    );
+
+    let (mut client, mut server, mut buf) =
+        make_pair(KeyType::default(), &provider::DEFAULT_PROVIDER);
+    buf.handshake(&mut client, &mut server);
+    test(
+        &mut buf.server_input,
+        &mut buf.server_output,
+        &mut server,
+        &mut buf.client_input,
+        &mut buf.client_output,
+        &mut client,
+    );
+
+    fn test(
+        left_input: &mut VecInput,
+        left_output: &mut Vec<u8>,
+        left: &mut Connection<impl SideData, Tcp>,
+        right_input: &mut VecInput,
+        right_output: &mut Vec<u8>,
+        right: &mut Connection<impl SideData, Tcp>,
+    ) {
+        // left sends a request
+        left.refresh_traffic_keys(left_output)
+            .unwrap();
+        assert!(transfer(left_output, right_input) > 0);
+
+        // but subsequent requests are ignored
+        for _ in 0..5 {
+            left.refresh_traffic_keys(left_output)
+                .unwrap();
+            assert_eq!(transfer(left_output, right_input), 0);
+        }
+
+        // left's request is received by right, enacted on next write,
+        // right's response received by left
+        right
+            .read_tls(right_input, right_output)
+            .handle_all(&mut Vec::new())
+            .unwrap();
+        right
+            .write(b"yo".into(), right_output)
+            .unwrap();
+        assert!(transfer(right_output, left_input) > 0);
+        left.read_tls(left_input, left_output)
+            .handle_all(&mut Vec::new())
+            .unwrap();
+
+        // allows a further update to be sent.
+        left.refresh_traffic_keys(left_output)
+            .unwrap();
+        assert!(transfer(left_output, right_input) > 0);
+    }
+}
+
+#[test]
+fn test_automatic_refresh_traffic_keys() {
+    const fn encrypted_size(body: usize) -> usize {
+        let padding = 1;
+        let header = 5;
+        let tag = 16;
+        header + body + padding + tag
+    }
+
+    const KEY_UPDATE_SIZE: usize = encrypted_size(5);
+    let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::DEFAULT_PROVIDER);
+
+    let client_config = ClientConfig::builder(provider.clone()).finish(KeyType::default());
+    let server_config = ServerConfig::builder(provider).finish(KeyType::default());
+
+    let (mut client, mut server, mut buf) = make_pair_for_configs(client_config, server_config);
+    buf.handshake(&mut client, &mut server);
+
+    for i in 0..(CONFIDENTIALITY_LIMIT + 16) {
+        let message = format!("{i:08}");
+        client
+            .write(message.as_bytes().into(), &mut buf.client_output)
+            .unwrap();
+        let transferred = transfer(&mut buf.client_output, &mut buf.server_input);
+        let iter = server.read_tls(&mut buf.server_input, &mut buf.server_output);
+        let mut data = Vec::with_capacity(32);
+        let state = iter.handle_all(&mut data).unwrap();
+        println!("{}: {} -> {:?}", i, transferred, state);
+
+        // the key_update message takes the last record allowed under the initial key,
+        // so it is sent before the message that would otherwise take that record
+        assert_eq!(
+            transferred,
+            match i {
+                i if i == CONFIDENTIALITY_LIMIT - 1 => {
+                    KEY_UPDATE_SIZE + encrypted_size(message.len())
+                }
+                _ => encrypted_size(message.len()),
+            }
+        );
+
+        assert_eq!(&data, message.as_bytes());
+    }
+
+    // finally, server writes and pumps its key_update response
+    let message = b"finished";
+    server
+        .write(message.into(), &mut buf.server_output)
+        .unwrap();
+    let transferred = transfer(&mut buf.server_output, &mut buf.client_input);
+
+    println!(
+        "F: {} -> {:?}",
+        transferred,
+        client.read_tls(&mut buf.client_input, &mut buf.client_output)
+    );
+    assert_eq!(transferred, KEY_UPDATE_SIZE + encrypted_size(message.len()));
+}
+
+#[test]
+fn tls13_keys_are_updated_within_fragmented_write() {
+    // With this maximum fragment size, each record carries 10 bytes of plaintext
+    // and encrypts to 27 bytes, while an encrypted key_update message is 22 bytes.
+    const RECORD_PLAINTEXT_LEN: usize = 10;
+    const KEY_UPDATE_LEN: usize = 22;
+
+    let provider = aes_128_gcm_with_1024_confidentiality_limit(provider::DEFAULT_PROVIDER);
+    let mut client_config = ClientConfig::builder(provider.clone()).finish(KeyType::default());
+    client_config.max_fragment_size = Some(32);
+    client_config.enable_secret_extraction = true;
+    let server_config = ServerConfig::builder(provider).finish(KeyType::default());
+
+    let (mut client, mut server, mut buf) = make_pair_for_configs(client_config, server_config);
+    buf.handshake(&mut client, &mut server);
+
+    // A single write of enough records to exhaust the traffic keys twice over.
+    let records = 2 * CONFIDENTIALITY_LIMIT as usize + 1;
+    let payload = vec![0x42; records * RECORD_PLAINTEXT_LEN];
+    client
+        .write(payload.as_slice().into(), &mut buf.client_output)
+        .unwrap();
+
+    let mut key_updates = Vec::new();
+    let mut index = 0;
+    let mut wire = buf.client_output.as_slice();
+    while !wire.is_empty() {
+        let len = usize::from(u16::from_be_bytes([wire[3], wire[4]]));
+        if len == KEY_UPDATE_LEN {
+            key_updates.push(index);
+        }
+        wire = &wire[5 + len..];
+        index += 1;
+    }
+
+    // Each key_update message takes the last record allowed under the previous keys.
+    let limit = CONFIDENTIALITY_LIMIT as usize;
+    assert_eq!(key_updates, [limit - 1, 2 * limit - 1]);
+    assert_eq!(index, records + 2);
+
+    let mut received = Vec::new();
+    let mut wire = buf.client_output.as_slice();
+    while !wire.is_empty() {
+        buf.server_input
+            .read(&mut wire)
+            .unwrap();
+        server
+            .read_tls(&mut buf.server_input, &mut buf.server_output)
+            .handle_all(&mut received)
+            .unwrap();
+    }
+    assert_eq!(received, payload);
+
+    // The remaining records were encrypted under the newest keys.
+    let secrets = client
+        .dangerous_extract_secrets()
+        .unwrap();
+    assert_eq!(
+        secrets.tx.0,
+        records as u64 - 2 * (CONFIDENTIALITY_LIMIT - 1)
+    );
+}
+
+#[test]
+fn tls12_connection_fails_after_key_reaches_confidentiality_limit() {
+    let (mut client, mut client_output, mut server) = tls12_pair_with_limited_confidentiality();
+
+    for i in 0..CONFIDENTIALITY_LIMIT {
+        let message = format!("{i:08}");
+        let result = client.write(message.as_bytes().into(), &mut client_output);
+        let (received, peer_closed) = server.receive(&mut client_output);
+
+        match i {
+            1023 => {
+                assert_eq!(result, Err(Error::EncryptError));
+                assert!(peer_closed);
+                assert_eq!(received.len(), 0);
+            }
+            _ => {
+                result.unwrap();
+                assert!(!peer_closed);
+                assert_eq!(&received, message.as_bytes());
+            }
+        }
+    }
+}
+
+#[test]
+fn tls12_connection_fails_after_alert_at_confidentiality_limit() {
+    let (mut client, mut client_output, mut server) = tls12_pair_with_limited_confidentiality();
+
+    for i in 1..CONFIDENTIALITY_LIMIT {
+        client
+            .write(format!("{i:08}").as_bytes().into(), &mut client_output)
+            .unwrap();
+    }
+
+    let (received, peer_closed) = server.receive(&mut client_output);
+    assert!(!peer_closed);
+    assert_eq!(received.len(), (CONFIDENTIALITY_LIMIT as usize - 1) * 8);
+
+    // Alerts are not subject to the limit, so the client's rejection of a renegotiation
+    // request takes the last sequence number before it.
+    let mut raw_server = RawTls::new_server(server.conn);
+    let hello_request = Record {
+        typ: ContentType::Handshake,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: Payload::new(encoding::handshake_framing(
+            HandshakeType::HelloRequest,
+            vec![],
+        )),
+    };
+    let mut client_input = VecInput::default();
+    raw_server.encrypt_and_send(&hello_request, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    raw_server.receive_and_decrypt(&mut client_output, |m| {
+        assert_eq!(m.typ, ContentType::Alert);
+        assert_eq!(m.payload, &[0x01, 100]); // Warning=1, NoRenegotiation=100
+    });
+
+    // No application data may be encrypted with the exhausted key.
+    assert_eq!(
+        client.write(b"later".as_slice().into(), &mut client_output),
+        Err(Error::EncryptError)
+    );
+    raw_server.receive_and_decrypt(&mut client_output, |m| {
+        assert_eq!(m.typ, ContentType::Alert);
+        assert_eq!(m.payload, &[0x01, 0]); // Warning=1, CloseNotify=0
+    });
+}
+
+#[test]
+fn tls12_write_is_not_split_across_confidentiality_limit() {
+    let (mut client, mut client_output, mut server) = tls12_pair_with_limited_confidentiality();
+
+    // Leave three records before the limit.
+    for i in 1..CONFIDENTIALITY_LIMIT - 3 {
+        client
+            .write(format!("{i:08}").as_bytes().into(), &mut client_output)
+            .unwrap();
+    }
+
+    let (received, peer_closed) = server.receive(&mut client_output);
+    assert!(!peer_closed);
+    assert_eq!(received.len(), (CONFIDENTIALITY_LIMIT as usize - 4) * 8);
+
+    // A write that fits in the remaining records is sent in full.
+    let two_records = vec![b'a'; MAX_FRAGMENT_LEN + 1];
+    client
+        .write(two_records.as_slice().into(), &mut client_output)
+        .unwrap();
+    let (received, peer_closed) = server.receive(&mut client_output);
+    assert!(!peer_closed);
+    assert_eq!(received, two_records);
+
+    // With one record left, none of a two-record write is sent.
+    assert_eq!(
+        client.write(two_records.as_slice().into(), &mut client_output),
+        Err(Error::EncryptError)
+    );
+    let (received, peer_closed) = server.receive(&mut client_output);
+    assert!(peer_closed);
+    assert_eq!(received.len(), 0);
+}
+
+/// Complete a TLS 1.2 handshake using a suite limited to [`CONFIDENTIALITY_LIMIT`] records.
+///
+/// Returns the client, its pending output, and the server. The client's `Finished` message
+/// used sequence number 0. The server has secret extraction enabled.
+fn tls12_pair_with_limited_confidentiality() -> (Connection<ClientSide, Tcp>, Vec<u8>, LimitedServer)
+{
+    let provider = Arc::new(CryptoProvider {
+        tls13_cipher_suites: Default::default(),
+        ..Arc::unwrap_or_clone(aes_128_gcm_with_1024_confidentiality_limit(
+            provider::DEFAULT_PROVIDER,
+        ))
+    });
+
+    let kt = KeyType::EcdsaP256;
+    let client_config = ClientConfig::builder(provider.clone()).finish(kt);
+    let mut server_config = ServerConfig::builder(provider).finish(kt);
+    server_config.enable_secret_extraction = true;
+
+    let (mut client, mut server, mut buf) = make_pair_for_configs(client_config, server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let server = LimitedServer {
+        conn: server,
+        input: buf.server_input,
+        output: buf.server_output,
+    };
+    (client, buf.client_output, server)
+}
+
+/// Default maximum plaintext length of a record.
+const MAX_FRAGMENT_LEN: usize = 16_384;
+
+struct LimitedServer {
+    conn: Connection<ServerSide, Tcp>,
+    input: VecInput,
+    output: Vec<u8>,
+}
+
+impl LimitedServer {
+    /// Deliver `flight` to the server.
+    ///
+    /// Returns the application data received, and whether the client has closed.
+    fn receive(&mut self, flight: &mut Vec<u8>) -> (Vec<u8>, bool) {
+        transfer(flight, &mut self.input);
+        let mut received = Vec::new();
+        let state = self
+            .conn
+            .read_tls(&mut self.input, &mut self.output)
+            .handle_all(&mut received)
+            .unwrap();
+        (received, state.peer_has_closed())
+    }
+}
+
+#[test]
+fn test_keys_match_for_all_signing_key_types() {
+    let provider = provider::DEFAULT_PROVIDER;
+    for kt in KeyType::all_for_provider(&provider) {
+        let key = provider
+            .key_provider
+            .load_private_key(kt.client_key())
+            .unwrap();
+        let _ = Credentials::new(kt.client_identity(), key).expect("keys match");
+        println!("{kt:?} ok");
+    }
+}
+
+#[test]
+fn test_wire_version_passed_to_aad() {
+    for (client_config, server_config, expect) in MultiTest::new(provider::DEFAULT_PROVIDER) {
+        println!("{expect:?}");
+
+        // corrupt type and low-byte of version
+        for byte in [0, 2] {
+            let (mut client, mut server, mut buf) =
+                make_pair_for_arc_configs(&client_config, &server_config);
+            buf.handshake(&mut client, &mut server);
+
+            // base case
+            client
+                .write(b"hello".into(), &mut buf.client_output)
+                .unwrap();
+            transfer(&mut buf.client_output, &mut buf.server_input);
+            let mut server_received = Vec::new();
+            server
+                .read_tls(&mut buf.server_input, &mut buf.server_output)
+                .handle_all(&mut server_received)
+                .unwrap();
+            assert_eq!(server_received, b"hello");
+
+            // fail case
+            client
+                .write(b"world".into(), &mut buf.client_output)
+                .unwrap();
+            buf.client_output[byte] ^= 0x01;
+            transfer(&mut buf.client_output, &mut buf.server_input);
+            assert_eq!(
+                server
+                    .read_tls(&mut buf.server_input, &mut buf.server_output)
+                    .handle_all(&mut server_received)
+                    .unwrap_err(),
+                Error::DecryptError
+            );
+        }
+    }
+}
+
+/// A TLS1.3 client must not accept `EncryptedExtensions` carried in the same
+/// plaintext record as `ServerHello`.
+///
+/// The server's first flight is rewritten so the complete `EncryptedExtensions`
+/// message follows `ServerHello` in its unprotected record, and the remaining
+/// handshake messages are re-encrypted under the server handshake traffic secret.
+/// The transcript is unchanged, so only the key change alignment check can
+/// catch this.
+#[test]
+fn client_rejects_encrypted_extensions_in_server_hello_record() {
+    let suite = cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let provider: Arc<CryptoProvider> = provider_with_one_suite(
+        &provider::DEFAULT_PROVIDER,
+        SupportedCipherSuite::Tls13(suite),
+    )
+    .into();
+    let kt = KeyType::default();
+
+    let key_log = Arc::new(KeyLogToVec::new("server"));
+    let mut server_config = ServerConfig::builder(provider.clone()).finish(kt);
+    server_config.key_log = key_log.clone();
+    let client_config = ClientConfig::builder(provider).finish(kt);
+
+    let (mut client, mut server, mut buf) = make_pair_for_configs(client_config, server_config);
+
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    server
+        .read_tls(&mut buf.server_input, &mut buf.server_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    let secret = key_log
+        .take()
+        .into_iter()
+        .find(|item| item.label == "SERVER_HANDSHAKE_TRAFFIC_SECRET")
+        .unwrap()
+        .secret;
+    let flight = move_encrypted_extensions_into_server_hello(&buf.server_output, suite, &secret);
+    buf.client_input
+        .read(&mut Cursor::new(&flight))
+        .unwrap();
+    buf.server_output.clear();
+
+    assert_eq!(
+        buf.handshake_until_error(&mut client, &mut server)
+            .unwrap_err(),
+        ErrorFromPeer::Client(PeerMisbehaved::KeyEpochWithPendingFragment.into())
+    );
+}
+
+fn move_encrypted_extensions_into_server_hello(
+    flight: &[u8],
+    suite: &Tls13CipherSuite,
+    secret: &[u8],
+) -> Vec<u8> {
+    let expander = suite
+        .hkdf_provider
+        .expander_for_okm(&OkmBlock::new(secret));
+    let traffic_key = || -> (AeadKey, Iv) {
+        (
+            hkdf_expand_label::<AeadKey, 16>(&*expander, b"key"),
+            hkdf_expand_label::<Iv, 12>(&*expander, b"iv"),
+        )
+    };
+
+    let mut records = split_records(flight);
+
+    let (key, iv) = traffic_key();
+    let mut decrypter = suite.aead_alg.decrypter(key, iv);
+    let mut handshake = Vec::new();
+    for (seq, record) in records
+        .iter_mut()
+        .filter(|record| record[0] == u8::from(ContentType::ApplicationData))
+        .enumerate()
+    {
+        let decrypted = decrypter
+            .decrypt(
+                Record {
+                    typ: ContentType::ApplicationData,
+                    version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+                    payload: InboundOpaque(&mut record[5..]),
+                },
+                seq as u64,
+            )
+            .unwrap();
+        assert_eq!(decrypted.typ, ContentType::Handshake);
+        handshake.extend_from_slice(decrypted.payload);
+    }
+
+    assert_eq!(handshake[0], HandshakeType::EncryptedExtensions.0);
+    let ee_len = 4 + u32::from_be_bytes([0, handshake[1], handshake[2], handshake[3]]) as usize;
+    let (encrypted_extensions, remainder) = handshake.split_at(ee_len);
+
+    let mut output = Vec::new();
+    for record in records
+        .iter()
+        .filter(|record| record[0] != u8::from(ContentType::ApplicationData))
+    {
+        let mut body = record[5..].to_vec();
+        if record[0] == u8::from(ContentType::Handshake) {
+            assert_eq!(body[0], HandshakeType::ServerHello.0);
+            body.extend_from_slice(encrypted_extensions);
+        }
+        output.extend(encoding::record_framing(
+            ContentType::from(record[0]),
+            ProtocolVersion::TLSv1_2,
+            body,
+        ));
+    }
+
+    let (key, iv) = traffic_key();
+    let mut encrypter = suite.aead_alg.encrypter(key, iv);
+    let remainder = Record {
+        typ: ContentType::Handshake,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: Payload::Borrowed(remainder),
+    };
+    encrypter
+        .encrypt(remainder.borrow_outbound(), 0, &mut output)
+        .unwrap();
+    output
+}
+
+#[test]
+fn server_rejects_finished_in_end_of_early_data_record() {
+    let suite = cipher_suite::TLS13_AES_128_GCM_SHA256;
+    let provider: Arc<CryptoProvider> = provider_with_one_suite(
+        &provider::DEFAULT_PROVIDER,
+        SupportedCipherSuite::Tls13(suite),
+    )
+    .into();
+    let kt = KeyType::default();
+
+    let key_log = Arc::new(KeyLogToVec::new("client"));
+    let mut client_config = ClientConfig::builder(provider.clone()).finish(kt);
+    client_config.enable_early_data = true;
+    client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+    client_config.key_log = key_log.clone();
+    let mut server_config = ServerConfig::builder(provider).finish(kt);
+    server_config.max_early_data_size = 1234;
+    let (client_config, server_config) = (Arc::new(client_config), Arc::new(server_config));
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    key_log.take();
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(b"hello".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+
+    let early_records = split_records(&buf.client_output)
+        .iter()
+        .filter(|record| record[0] == u8::from(ContentType::ApplicationData))
+        .count();
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    let mut handler = server.read_tls(&mut buf.server_input, &mut buf.server_output);
+    while let Some(result) = handler.next_early_data() {
+        assert_eq!(result.unwrap().bytes(), b"hello");
+    }
+    handler
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    transfer(&mut buf.server_output, &mut buf.client_input);
+    client
+        .read_tls(&mut buf.client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    assert!(client.side().is_early_data_accepted());
+
+    let secrets = key_log.take();
+    let secret = |label: &str| {
+        secrets
+            .iter()
+            .find(|item| item.label == label)
+            .unwrap()
+            .secret
+            .clone()
+    };
+    let traffic_key = |secret: &[u8]| -> (AeadKey, Iv) {
+        let expander = suite
+            .hkdf_provider
+            .expander_for_okm(&OkmBlock::new(secret));
+        (
+            hkdf_expand_label::<AeadKey, 16>(&*expander, b"key"),
+            hkdf_expand_label::<Iv, 12>(&*expander, b"iv"),
+        )
+    };
+    let early_secret = secret("CLIENT_EARLY_TRAFFIC_SECRET");
+    let handshake_secret = secret("CLIENT_HANDSHAKE_TRAFFIC_SECRET");
+
+    let mut records = split_records(&buf.client_output);
+    buf.client_output.clear();
+    let mut encrypted = records
+        .iter_mut()
+        .filter(|record| record[0] == u8::from(ContentType::ApplicationData));
+
+    let (key, iv) = traffic_key(&early_secret);
+    let end_of_early_data = suite
+        .aead_alg
+        .decrypter(key, iv)
+        .decrypt(
+            Record {
+                typ: ContentType::ApplicationData,
+                version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+                payload: InboundOpaque(&mut encrypted.next().unwrap()[5..]),
+            },
+            early_records as u64,
+        )
+        .unwrap();
+    assert_eq!(end_of_early_data.typ, ContentType::Handshake);
+    assert_eq!(
+        end_of_early_data.payload[0],
+        HandshakeType::EndOfEarlyData.0
+    );
+    let mut handshake = end_of_early_data.payload.to_vec();
+
+    let (key, iv) = traffic_key(&handshake_secret);
+    let finished = suite
+        .aead_alg
+        .decrypter(key, iv)
+        .decrypt(
+            Record {
+                typ: ContentType::ApplicationData,
+                version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+                payload: InboundOpaque(&mut encrypted.next().unwrap()[5..]),
+            },
+            0,
+        )
+        .unwrap();
+    assert_eq!(finished.typ, ContentType::Handshake);
+    assert_eq!(finished.payload[0], HandshakeType::Finished.0);
+    handshake.extend_from_slice(finished.payload);
+
+    let (key, iv) = traffic_key(&early_secret);
+    let combined = Record {
+        typ: ContentType::Handshake,
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: Payload::Borrowed(&handshake),
+    };
+    let mut flight = Vec::new();
+    suite
+        .aead_alg
+        .encrypter(key, iv)
+        .encrypt(
+            combined.borrow_outbound(),
+            early_records as u64,
+            &mut flight,
+        )
+        .unwrap();
+    buf.server_input
+        .read(&mut Cursor::new(&flight))
+        .unwrap();
+
+    assert_eq!(
+        buf.handshake_until_error(&mut client, &mut server)
+            .unwrap_err(),
+        ErrorFromPeer::Server(PeerMisbehaved::KeyEpochWithPendingFragment.into())
+    );
+}
+
+fn split_records(mut flight: &[u8]) -> Vec<Vec<u8>> {
+    let mut records = Vec::new();
+    while !flight.is_empty() {
+        let len = u16::from_be_bytes([flight[3], flight[4]]) as usize;
+        records.push(flight[..5 + len].to_vec());
+        flight = &flight[5 + len..];
+    }
+    records
+}
+
+fn hkdf_expand_label<T: From<[u8; N]>, const N: usize>(
+    expander: &dyn HkdfExpander,
+    label: &[u8],
+) -> T {
+    expand(
+        expander,
+        &[
+            &(N as u16).to_be_bytes(),
+            &[(b"tls13 ".len() + label.len()) as u8],
+            b"tls13 ",
+            label,
+            &[0],
+        ],
+    )
+}
+
+const CONFIDENTIALITY_LIMIT: u64 = 1024;

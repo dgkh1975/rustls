@@ -1,321 +1,175 @@
 <p align="center">
-  <img width="460" height="300" src="https://raw.githubusercontent.com/ctz/rustls/main/admin/rustls-logo-web.png">
+  <img width="512" src="https://raw.githubusercontent.com/rustls/rustls/main/admin/logo/rustls.svg">
 </p>
 
 <p align="center">
-Rustls is a modern TLS library written in Rust.  It's pronounced 'rustles'. It uses <a href = "https://github.com/briansmith/ring"><em>ring</em></a> for cryptography and <a href = "https://github.com/briansmith/webpki">libwebpki</a> for certificate
-verification.
+Rustls is a modern TLS library written in Rust.
 </p>
 
 # Status
-Rustls is ready for use.  There are no major breaking interface changes
-expected.  [Here's what I'm working on now](https://github.com/ctz/rustls/projects/1).
 
-If you'd like to help out, please see [CONTRIBUTING.md](CONTRIBUTING.md).
+Rustls is used in production at many organizations and projects. We aim to maintain
+reasonable API surface stability but the API may evolve as we make changes to accommodate
+new features or performance improvements.
 
-[![Build Status](https://github.com/ctz/rustls/workflows/rustls/badge.svg)](https://github.com/ctz/rustls/actions)
-[![Build Status](https://dev.azure.com/ctz99/ctz/_apis/build/status/ctz.rustls?branchName=main)](https://dev.azure.com/ctz99/ctz/_build/latest?definitionId=3&branchName=main)
-[![Coverage Status (codecov.io)](https://codecov.io/gh/ctz/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/ctz/rustls/)
+We have a [roadmap](https://github.com/rustls/rustls/blob/main/ROADMAP.md) for our future plans. We also have [benchmarks](https://github.com/rustls/rustls/blob/main/BENCHMARKING.md) to
+prevent performance regressions and to let you evaluate rustls on your target hardware.
+
+If you'd like to help out, please see [CONTRIBUTING.md](https://github.com/rustls/rustls/blob/main/CONTRIBUTING.md).
+
+[![Build Status](https://github.com/rustls/rustls/actions/workflows/build.yml/badge.svg?branch=main)](https://github.com/rustls/rustls/actions/workflows/build.yml?query=branch%3Amain)
+[![Coverage Status (codecov.io)](https://codecov.io/gh/rustls/rustls/branch/main/graph/badge.svg)](https://codecov.io/gh/rustls/rustls/)
 [![Documentation](https://docs.rs/rustls/badge.svg)](https://docs.rs/rustls/)
+[![Chat](https://img.shields.io/discord/976380008299917365?logo=discord)](https://discord.gg/MCSB76RU96)
+[![OpenSSF Best Practices](https://www.bestpractices.dev/projects/9034/badge)](https://www.bestpractices.dev/projects/9034)
 
-## Release history:
+The maintainers pronounce "rustls" as rustles (rather than rust-TLS), but we don't feel strongly
+about it.
 
-* Next release:
-  - Planned: removal of unused signature verification schemes at link-time.
-  - *Breaking API change*: PEM parsing now lives in the [rustls-pemfile crate](https://crates.io/crates/rustls-pemfile).
-    This means `rustls::internals::pemfile` and `rustls::RootCertStore::add_pem_file` no longer exist.
-  - *Breaking API change*: `ServerCertVerifier::verify_server_cert` and `ClientCertVerifier::verify_client_cert`
-    pass the end-entity and intermediate certificates separately.  This means rustls deals with the case
-    where the certificate chain is empty, rather than leaving that to ServerCertVerifier/ClientCertVerifier
-    implementation.
-* 0.19.0 (2020-11-22):
-  - Ensured that `get_peer_certificates` is both better documented, and works
-    uniformly for both full-handshake and resumed sessions.
-  - Fix bug: fully qualified hostnames should have had their trailing dot
-    stripped when quoted in the SNI extension.
-* 0.18.1 (2020-08-16):
-  - Fix DoS vulnerability in TLS1.3 "Middlebox Compatibility Mode" CCS handling.
-    This is thought to be quite minor -- see
-    [this commit message](https://github.com/ctz/rustls/commit/e51bf92afcd9dfbd5f4e8154b847aa5cc380913c)
-    for a full discussion.
-* 0.18.0 (2020-07-04):
-  - Allow custom certificate validation implementations to also
-    handle handshake signature computation.  This allows uses in non-web
-    contexts, where `webpki` is not likely to process the certificates
-    in use.  Thanks to @DemiMarie-parity.
-  - Performance improvements.  Thanks to @nviennot.
-  - Fixed client authentication being unduly rejected by client when server
-    uses the superseded certificate_types field of CertificateRequest.
-  - *Breaking API change*: The writev_tls API has been removed, in favour
-    of using vectored IO support now offered by std::io::Write.
-  - Added ed25519 support for authentication; thanks to @potatosalad.
-  - Support removal of unused ciphersuites at link-time.  To use this,
-    call `ClientConfig::with_ciphersuites` instead of `ClientConfig::new`.
-* 0.17.0 (2020-02-22):
-  - *Breaking API change*: ALPN protocols offered by the client are passed
-    to the server certificate resolution trait (`ResolvesServerCert`).
-  - *Breaking API change*: The server certificate resolution trait now
-    takes a struct containing its arguments, so new data can be passed
-    to these functions without further breaking changes.
-  - Signature schemes offered by the client are now filtered to those
-    compatible with the client-offered ciphersuites.  Prior to this change
-    it was likely that server key type switching would not work for clients
-    that offer signature schemes mismatched with their ciphersuites.
-  - Add manual with goal-oriented documentation, and rationale for design
-    decisions.
-  - *Breaking API change*: `AlwaysResolvesClientCert::new` is now fallible,
-    as is `ClientConfig::set_single_client_cert`.
-* 0.16.0 (2019-08-10):
-  - Optimisation of read path for polled non-blocking IO.
-  - Correct an omission in TLS1.3 middlebox compatibility mode, causing
-    handshake failures with servers behind buggy middleboxes.
-  - Move to *ring* 0.16.
-  - Assorted refactoring to reduce memory usage during and after
-    handshake.
-  - Update other dependencies.
-* 0.15.2 (2019-04-02):
-  - Moved example code around for benefit of Fuchsia.
-  - Example code fixes for Windows -- Windows is now a tested platform.
-  - QUIC-specific bug fixes.
-  - Update dependencies.
-* 0.15.1 (2019-01-29):
-  - Fix incorrect offering of SHA1.
-* 0.15.0 (2019-01-20):
-  - Update dependencies.
-  - *Breaking API change*: ALPN protocols are now encoded as a `Vec<u8>`, not
-    a `String`.  This alters the type of:
-    - `ClientConfig::alpn_protocols`
-    - `ClientConfig::set_protocols`
-    - `ServerConfig::alpn_protocols`
-    - `ServerConfig::set_protocols`
-    - `Session::get_alpn_protocol`
-  - Emit a warning when receiving an invalid SNI extension, such as one
-    including an IP address.
-  - Extended QUIC support for later QUIC drafts.
-  - Correct bug where we'd send more than one fatal alert for
-    handshake failure cases.
-  - Discontinue support for SHA1 signatures.
-  - Move to Rust 2018 edition.
-* 0.14.0 (2018-09-30):
-  - Introduce client-side support for 0-RTT data in TLS1.3.
-  - Fix a bug in rustls::Stream for non-blocking transports.
-  - Move TLS1.3 support from draft 23 to final RFC8446 version.
-  - Don't offer (e.g.) TLS1.3 if no TLS1.3 suites are configured.
-  - Support stateful resumption in TLS1.3.  Stateless resumption
-    was previously supported, but is not the default configuration.
-  - *Breaking API change*: `generate()` removed from `StoresServerSessions` trait.
-  - *Breaking API change*: `take()` added to `StoresServerSessions` trait.
-* 0.13.1 (2018-08-17):
-  - Fix a bug in rustls::Stream for non-blocking transports
-    (backport).
-* 0.13.0 (2018-07-15):
-  - Move TLS1.3 support from draft 22 to 23.
-  - Add support for `SSLKEYLOGFILE`; not enabled by default.
-  - Add support for basic usage in QUIC.
-  - `ServerConfig::set_single_cert` and company now report errors.
-  - Add support for vectored IO: `writev_tls` can now be used to
-    optimise system call usage.
-  - Support ECDSA signing for server and client authentication.
-  - Add type like `rustls::Stream` which owns its underlying TCP stream
-    and rustls session.
+## Changelog
 
-See [OLDCHANGES.md](OLDCHANGES.md) for further change history.
+The detailed list of changes in each release can be found at
+https://github.com/rustls/rustls/releases.
 
 # Documentation
-Lives here: https://docs.rs/rustls/
+
+https://docs.rs/rustls/
 
 # Approach
+
 Rustls is a TLS library that aims to provide a good level of cryptographic security,
 requires no configuration to achieve that security, and provides no unsafe features or
-obsolete cryptography.
+obsolete cryptography by default.
 
-## Current features
-
-* TLS1.2 and TLS1.3.
-* ECDSA, Ed25519 or RSA server authentication by clients.
-* ECDSA, Ed25519 or RSA server authentication by servers.
-* Forward secrecy using ECDHE; with curve25519, nistp256 or nistp384 curves.
-* AES128-GCM and AES256-GCM bulk encryption, with safe nonces.
-* ChaCha20-Poly1305 bulk encryption ([RFC7905](https://tools.ietf.org/html/rfc7905)).
-* ALPN support.
-* SNI support.
-* Tunable MTU to make TLS messages match size of underlying transport.
-* Optional use of vectored IO to minimise system calls.
-* TLS1.2 session resumption.
-* TLS1.2 resumption via tickets (RFC5077).
-* TLS1.3 resumption via tickets or session storage.
-* TLS1.3 0-RTT data for clients.
-* Client authentication by clients.
-* Client authentication by servers.
-* Extended master secret support (RFC7627).
-* Exporters (RFC5705).
-* OCSP stapling by servers.
-* SCT stapling by servers.
-* SCT verification by clients.
-
-## Possible future features
-
-* PSK support.
-* OCSP verification by clients.
-* Certificate pinning.
-
-## Non-features
-
-The following things are broken, obsolete, badly designed, underspecified,
-dangerous and/or insane. Rustls does not support:
-
-* SSL1, SSL2, SSL3, TLS1 or TLS1.1.
-* RC4.
-* DES or triple DES.
-* EXPORT ciphersuites.
-* MAC-then-encrypt ciphersuites.
-* Ciphersuites without forward secrecy.
-* Renegotiation.
-* Kerberos.
-* Compression.
-* Discrete-log Diffie-Hellman.
-* Automatic protocol version downgrade.
-* AES-GCM with unsafe nonces.
-
-There are plenty of other libraries that provide these features should you
-need them.
+Rustls implements TLS1.2 and TLS1.3 for both clients and servers. See [the full
+list of protocol features](https://docs.rs/rustls/latest/rustls/manual/_04_features/index.html).
 
 ### Platform support
 
-Rustls uses [`ring`](https://crates.io/crates/ring) for implementing the
-cryptography in TLS. As a result, rustls only runs on platforms
-[supported by `ring`](https://github.com/briansmith/ring#online-automated-testing).
-At the time of writing this means x86, x86-64, armv7, and aarch64.
+While Rustls itself is platform independent, it requires the use of cryptography primitives
+for implementing the cryptography algorithms used in TLS. In Rustls, a
+[`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
+
+By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
+can replace all cryptography dependencies of rustls.  This is a route to being portable
+to a wider set of architectures and environments, or compliance requirements.  See the
+[`crypto::CryptoProvider`] documentation for more details.
+
+[`crypto::CryptoProvider`]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html
+
+### Cryptography providers
+
+Since Rustls 0.22 it has been possible to choose the provider of the cryptographic primitives
+that Rustls uses. This may be appealing if you have specific platform, compliance or feature
+requirements.
+
+From 0.24, users must explicitly provide a crypto provider when constructing `ClientConfig` or
+`ServerConfig` instances. See the [`crypto::CryptoProvider`] documentation for more details.
+
+#### First-party providers
+
+The Rustls project currently maintains two cryptography providers:
+
+* [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
+While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
+performance and a complete feature set (including post-quantum algorithms).
+* [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
+provider is easier to build on a variety of platforms, but has a more limited feature set
+(for example, it does not support post-quantum algorithms).
+
+The Rustls team recommends using the [`rustls-aws-lc-rs`] crate for its complete feature set
+and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
+platform/architecture support constraints in aws-lc-rs.
+
+See the documentation for [`crypto::CryptoProvider`] for details on how providers are
+selected.
+
+(For rustls versions prior to 0.24, both of these providers were shipped as part of the rustls
+crate, and Cargo features were used to select the preferred provider. The `aws-lc-rs` feature
+was enabled by default.)
+
+[`rustls-aws-lc-rs`]: https://crates.io/crates/rustls-aws-lc-rs
+[`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
+[aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
+[`rustls-ring`]: https://crates.io/crates/rustls-ring
+[`ring`]: https://crates.io/crates/ring
+
+#### Third-party providers
+
+The community has also developed many third-party providers for Rustls. Some of particular note
+include:
+
+* [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
+* [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
+
+[`rustls-graviola`]: https://crates.io/crates/rustls-graviola
+[`graviola`]: https://github.com/ctz/graviola
+[`rustls-symcrypt`]: https://github.com/microsoft/rustls-symcrypt
+[SymCrypt]: https://github.com/microsoft/SymCrypt
+[`rustls-openssl`]: https://github.com/tofay/rustls-openssl
+[OpenSSL]: https://openssl-library.org/
+
+For more third-party providers, see [PROVIDERS.md].
+
+See the [Making a custom CryptoProvider] section of the documentation for more information
+on this topic.
+
+[Making a custom CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#making-a-custom-cryptoprovider
+[PROVIDERS.md]: https://github.com/rustls/rustls/blob/main/PROVIDERS.md
 
 # Example code
-There are two example programs which use
-[mio](https://github.com/carllerche/mio) to do asynchronous IO.
+
+Our [examples] directory contains demos that show how to handle I/O using the
+[`stream::Stream`] helper, as well as more complex asynchronous I/O using [`mio`].
+If you're already using Tokio for an async runtime you may prefer to use
+[`tokio-rustls`] instead of interacting with rustls directly.
+
+The [`mio`] based examples are the most complete, and discussed below. Users
+new to Rustls may prefer to look at the simple client/server examples before
+diving in to the more complex MIO examples.
+
+[examples]: examples/
+[`stream::Stream`]: https://docs.rs/rustls/latest/rustls/struct.Stream.html
+[`mio`]: https://docs.rs/mio/latest/mio/
+[`tokio-rustls`]: https://docs.rs/tokio-rustls/latest/tokio_rustls/
 
 ## Client example program
-The client example program is named `tlsclient`.  The interface looks like:
 
-```tlsclient
-Connects to the TLS server at hostname:PORT.  The default PORT
-is 443.  By default, this reads a request from stdin (to EOF)
-before making the connection.  --http replaces this with a
-basic HTTP GET request for /.
-
-If --cafile is not supplied, a built-in set of CA certificates
-are used from the webpki-roots crate.
-
-Usage:
-  tlsclient [options] [--suite SUITE ...] [--proto PROTO ...] <hostname>
-  tlsclient (--version | -v)
-  tlsclient (--help | -h)
-
-Options:
-    -p, --port PORT     Connect to PORT [default: 443].
-    --http              Send a basic HTTP GET request for /.
-    --cafile CAFILE     Read root certificates from CAFILE.
-    --auth-key KEY      Read client authentication key from KEY.
-    --auth-certs CERTS  Read client authentication certificates from CERTS.
-                        CERTS must match up with KEY.
-    --protover VERSION  Disable default TLS version list, and use
-                        VERSION instead.  May be used multiple times.
-    --suite SUITE       Disable default cipher suite list, and use
-                        SUITE instead.  May be used multiple times.
-    --proto PROTOCOL    Send ALPN extension containing PROTOCOL.
-                        May be used multiple times to offer several protocols.
-    --cache CACHE       Save session cache to file CACHE.
-    --no-tickets        Disable session ticket support.
-    --no-sni            Disable server name indication support.
-    --insecure          Disable certificate verification.
-    --verbose           Emit log output.
-    --mtu MTU           Limit outgoing messages to MTU bytes.
-    --version, -v       Show tool version.
-    --help, -h          Show this screen.
-```
+The MIO client example program is named `tls-client-mio`.
 
 Some sample runs:
 
 ```
-$ cargo run --example tlsclient -- --http mozilla-modern.badssl.com
+$ cargo run --bin tls-client-mio -- --http jbp.io
 HTTP/1.1 200 OK
-Server: nginx/1.6.2 (Ubuntu)
-Date: Wed, 01 Jun 2016 18:44:00 GMT
-Content-Type: text/html
-Content-Length: 644
+Date: Tue, 23 Jun 2026 16:13:40 GMT
+Content-Type: text/html; charset=utf-8
+Connection: close
 (...)
 ```
 
-or
-
-```
-$ cargo run --example tlsclient -- --http expired.badssl.com
-TLS error: WebPKIError(CertExpired)
-Connection closed
-```
+Run `cargo run --bin tls-client-mio -- --help` for more options.
 
 ## Server example program
-The server example program is named `tlsserver`.  The interface looks like:
 
-```tlsserver
-Runs a TLS server on :PORT.  The default PORT is 443.
-
-`echo' mode means the server echoes received data on each connection.
-
-`http' mode means the server blindly sends a HTTP response on each
-connection.
-
-`forward' means the server forwards plaintext to a connection made to
-localhost:fport.
-
-`--certs' names the full certificate chain, `--key' provides the
-RSA private key.
-
-Usage:
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] echo
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] http
-  tlsserver --certs CERTFILE --key KEYFILE [--suite SUITE ...] [--proto PROTO ...] [options] forward <fport>
-  tlsserver (--version | -v)
-  tlsserver (--help | -h)
-
-Options:
-    -p, --port PORT     Listen on PORT [default: 443].
-    --certs CERTFILE    Read server certificates from CERTFILE.
-                        This should contain PEM-format certificates
-                        in the right order (the first certificate should
-                        certify KEYFILE, the last should be a root CA).
-    --key KEYFILE       Read private key from KEYFILE.  This should be a RSA
-                        private key or PKCS8-encoded private key, in PEM format.
-    --ocsp OCSPFILE     Read DER-encoded OCSP response from OCSPFILE and staple
-                        to certificate.  Optional.
-    --auth CERTFILE     Enable client authentication, and accept certificates
-                        signed by those roots provided in CERTFILE.
-    --require-auth      Send a fatal alert if the client does not complete client
-                        authentication.
-    --resumption        Support session resumption.
-    --tickets           Support tickets.
-    --protover VERSION  Disable default TLS version list, and use
-                        VERSION instead.  May be used multiple times.
-    --suite SUITE       Disable default cipher suite list, and use
-                        SUITE instead.  May be used multiple times.
-    --proto PROTOCOL    Negotiate PROTOCOL using ALPN.
-                        May be used multiple times.
-    --verbose           Emit log output.
-    --version, -v       Show tool version.
-    --help, -h          Show this screen.
-```
+The MIO server example program is named `tls-server-mio`.
 
 Here's a sample run; we start a TLS echo server, then connect to it with
-openssl and tlsclient:
+`openssl` and `tls-client-mio`:
 
 ```
-$ cargo run --example tlsserver -- --certs test-ca/rsa/end.fullchain --key test-ca/rsa/end.rsa -p 8443 echo &
+$ cargo run --bin tls-server-mio -- --certs test-ca/rsa-2048/end.fullchain --key test-ca/rsa-2048/end.key -p 8443 echo &
 $ echo hello world | openssl s_client -ign_eof -quiet -connect localhost:8443
 depth=2 CN = ponytown RSA CA
 verify error:num=19:self signed certificate in certificate chain
 hello world
 ^C
-$ echo hello world | cargo run --example tlsclient -- --cafile test-ca/rsa/ca.cert -p 8443 localhost
+$ echo hello world | cargo run --bin tls-client-mio -- --cafile test-ca/rsa-2048/ca.cert --port 8443 localhost
 hello world
 ^C
 ```
+
+Run `cargo run --bin tls-server-mio -- --help` for more options.
 
 # License
 
@@ -329,3 +183,21 @@ These are included as LICENSE-APACHE, LICENSE-MIT and LICENSE-ISC
 respectively.  You may use this software under the terms of any
 of these licenses, at your option.
 
+# Project Membership
+
+- Joe Birr-Pixton ([@ctz], Project Founder - full-time funded by [Prossimo])
+- Dirkjan Ochtman ([@djc], Co-maintainer)
+- Daniel McCarney ([@cpu], Co-maintainer)
+- Josh Aas ([@bdaehlie], Project Management)
+
+[@ctz]: https://github.com/ctz
+[@djc]: https://github.com/djc
+[@cpu]: https://github.com/cpu
+[@bdaehlie]: https://github.com/bdaehlie
+[Prossimo]: https://www.memorysafety.org/initiative/rustls/
+
+# Code of conduct
+
+This project adopts the [Rust Code of Conduct](https://www.rust-lang.org/policies/code-of-conduct).
+Please email rustls-mod@googlegroups.com to report any instance of misconduct, or if you
+have any comments or questions on the Code of Conduct.

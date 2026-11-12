@@ -1,15 +1,41 @@
 #![no_main]
-#[macro_use] extern crate libfuzzer_sys;
+#[macro_use]
+extern crate libfuzzer_sys;
 extern crate rustls;
-extern crate webpki;
 
-use rustls::{ClientConfig, ClientSession, Session};
 use std::io;
 use std::sync::Arc;
 
+use rustls::{ClientConfig, VecInput};
+
 fuzz_target!(|data: &[u8]| {
-    let config = Arc::new(ClientConfig::new());
-    let example_com = webpki::DNSNameRef::try_from_ascii_str("example.com").unwrap();
-    let mut client = ClientSession::new(&config, example_com);
-    let _ = client.read_tls(&mut io::Cursor::new(data));
+    let config = Arc::new(
+        ClientConfig::builder(rustls_fuzzing_provider::PROVIDER.into())
+            .dangerous()
+            .with_custom_certificate_verifier(rustls_fuzzing_provider::server_verifier())
+            .with_no_client_auth()
+            .unwrap(),
+    );
+    let hostname = "localhost".try_into().unwrap();
+    let mut client = config
+        .connect(hostname)
+        .build(&mut Vec::new())
+        .unwrap();
+
+    let mut stream = io::Cursor::new(data);
+    let mut input = VecInput::default();
+    loop {
+        let rd = input.read(&mut stream);
+        if client
+            .read_tls(&mut input, &mut Vec::new())
+            .handle_all(&mut Vec::new())
+            .is_err()
+        {
+            break;
+        }
+
+        if matches!(rd, Ok(0) | Err(_)) {
+            break;
+        }
+    }
 });

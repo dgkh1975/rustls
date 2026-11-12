@@ -1,1 +1,2 @@
-chain_width=40
+# keep in sync with .rustfmt.unstable.toml
+chain_width = 40

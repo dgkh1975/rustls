@@ -1,128 +1,58 @@
-use sct;
-use std;
-use std::sync::Arc;
-use std::time::SystemTime;
-use webpki;
+use alloc::vec::Vec;
+use core::any::Any;
+use core::fmt::Debug;
+use core::hash::Hasher;
+use core::ops::Deref;
 
-use crate::anchors::OwnedTrustAnchor;
-use crate::anchors::{DistinguishedNames, RootCertStore};
-use crate::error::TLSError;
-use crate::key::Certificate;
-#[cfg(feature = "logging")]
-use crate::log::{debug, trace, warn};
-use crate::msgs::enums::SignatureScheme;
-use crate::msgs::handshake::DigitallySignedStruct;
-use crate::msgs::handshake::SCTList;
-use ring::digest::Digest;
+use pki_types::{CertificateDer, ServerName, SubjectPublicKeyInfoDer, UnixTime};
 
-type SignatureAlgorithms = &'static [&'static webpki::SignatureAlgorithm];
+use crate::crypto::cipher::Payload;
+use crate::crypto::{Identity, SignatureScheme};
+use crate::enums::CertificateType;
+use crate::error::{Error, InvalidMessage};
+use crate::msgs::{Codec, ListLength, MaybeEmpty, NonEmpty, Reader, SizedPayload, TlsListElement};
+use crate::sync::Arc;
+use crate::x509::wrap_in_sequence;
 
-/// Which signature verification mechanisms we support.  No particular
-/// order.
-static SUPPORTED_SIG_ALGS: SignatureAlgorithms = &[
-    &webpki::ECDSA_P256_SHA256,
-    &webpki::ECDSA_P256_SHA384,
-    &webpki::ECDSA_P384_SHA256,
-    &webpki::ECDSA_P384_SHA384,
-    &webpki::ED25519,
-    &webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY,
-    &webpki::RSA_PSS_2048_8192_SHA384_LEGACY_KEY,
-    &webpki::RSA_PSS_2048_8192_SHA512_LEGACY_KEY,
-    &webpki::RSA_PKCS1_2048_8192_SHA256,
-    &webpki::RSA_PKCS1_2048_8192_SHA384,
-    &webpki::RSA_PKCS1_2048_8192_SHA512,
-    &webpki::RSA_PKCS1_3072_8192_SHA384,
-];
-
-/// Marker types.  These are used to bind the fact some verification
-/// (certificate chain or handshake signature) has taken place into
-/// protocol states.  We use this to have the compiler check that there
-/// are no 'goto fail'-style elisions of important checks before we
-/// reach the traffic stage.
-///
-/// These types are public, but cannot be directly constructed.  This
-/// means their origins can be precisely determined by looking
-/// for their `assertion` constructors.
-pub struct HandshakeSignatureValid(());
-impl HandshakeSignatureValid {
-    /// Make a `HandshakeSignatureValid`
-    pub fn assertion() -> Self {
-        Self { 0: () }
-    }
-}
-
-pub struct FinishedMessageVerified(());
-impl FinishedMessageVerified {
-    pub fn assertion() -> Self {
-        Self { 0: () }
-    }
-}
-
-/// Zero-sized marker type representing verification of a server cert chain.
-pub struct ServerCertVerified(());
-impl ServerCertVerified {
-    /// Make a `ServerCertVerified`
-    pub fn assertion() -> Self {
-        Self { 0: () }
-    }
-}
-
-/// Zero-sized marker type representing verification of a client cert chain.
-pub struct ClientCertVerified(());
-impl ClientCertVerified {
-    /// Make a `ClientCertVerified`
-    pub fn assertion() -> Self {
-        Self { 0: () }
-    }
-}
+// Marker types.  These are used to bind the fact some verification
+// (certificate chain or handshake signature) has taken place into
+// protocol states.  We use this to have the compiler check that there
+// are no 'goto fail'-style elisions of important checks before we
+// reach the traffic stage.
+//
+// These types are public, but cannot be directly constructed.  This
+// means their origins can be precisely determined by looking
+// for their `assertion` constructors.
 
 /// Something that can verify a server certificate chain, and verify
 /// signatures made by certificates.
-pub trait ServerCertVerifier: Send + Sync {
-    /// Verify the end-entity certificate `end_entity` is valid for the
-    /// hostname `dns_name` and chains to at least one of the trust anchors
-    /// in `roots`.
+pub trait ServerVerifier: Debug + Send + Sync + Any {
+    /// Verify the server's identity.
     ///
-    /// `intermediates` contains the intermediate certificates the client sent
-    /// along with the end-entity certificate; it is in the same order that the
-    /// peer sent them and may be empty.
-    fn verify_server_cert(
+    /// Note that none of the certificates have been parsed yet, so it is the responsibility of
+    /// the implementer to handle invalid data. It is recommended that the implementer returns
+    /// [`Error::InvalidCertificate`] containing [`CertificateError::BadEncoding`] when these cases are encountered.
+    ///
+    /// [Certificate]: https://www.rfc-editor.org/info/rfc9846#section-4.5.1
+    /// [`CertificateError::BadEncoding`]: crate::error::CertificateError::BadEncoding
+    fn verify_identity<'a>(
         &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        roots: &RootCertStore,
-        dns_name: webpki::DNSNameRef,
-        ocsp_response: &[u8],
-        now: SystemTime,
-    ) -> Result<ServerCertVerified, TLSError>;
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error>;
 
     /// Verify a signature allegedly by the given server certificate.
     ///
-    /// `message` is not hashed, and needs hashing during the verification.
-    /// The signature and algorithm are within `dss`.  `cert` contains the
-    /// public key to use.
-    ///
-    /// `cert` is the same certificate that was previously validated by a
-    /// call to `verify_server_cert`.
-    ///
-    /// If and only if the signature is valid, return HandshakeSignatureValid.
+    /// If and only if the signature is valid, return `Ok(HandshakeSignatureValid)`.
     /// Otherwise, return an error -- rustls will send an alert and abort the
     /// connection.
     ///
     /// This method is only called for TLS1.2 handshakes.  Note that, in TLS1.2,
-    /// SignatureSchemes such as `SignatureScheme::ECDSA_NISTP256_SHA256` are not
+    /// SignatureSchemes such as [`SignatureScheme::ECDSA_NISTP256_SHA256`] are not
     /// in fact bound to the specific curve implied in their name.
-    ///
-    /// This trait method has a default implementation that uses webpki to verify
-    /// the signature.
     fn verify_tls12_signature(
         &self,
-        message: &[u8],
-        cert: &Certificate,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TLSError> {
-        verify_signed_struct(message, cert, dss)
-    }
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error>;
 
     /// Verify a signature allegedly by the given server certificate.
     ///
@@ -133,517 +63,424 @@ pub trait ServerCertVerifier: Send + Sync {
     /// must only validate signatures using public keys on the right curve --
     /// rustls does not enforce this requirement for you.
     ///
-    /// This trait method has a default implementation that uses webpki to verify
-    /// the signature.
+    /// If and only if the signature is valid, return `Ok(HandshakeSignatureValid)`.
+    /// Otherwise, return an error -- rustls will send an alert and abort the
+    /// connection.
     fn verify_tls13_signature(
         &self,
-        message: &[u8],
-        cert: &Certificate,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TLSError> {
-        verify_tls13(message, cert, dss)
-    }
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error>;
 
     /// Return the list of SignatureSchemes that this verifier will handle,
     /// in `verify_tls12_signature` and `verify_tls13_signature` calls.
     ///
     /// This should be in priority order, with the most preferred first.
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
+
+    /// Return true if this verifier will process stapled OCSP responses.
     ///
-    /// This trait method has a default implementation that reflects the schemes
-    /// supported by webpki.
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        WebPKIVerifier::verification_schemes()
+    /// This controls whether a client will ask the server for a stapled OCSP response.
+    /// There is no guarantee the server will provide one.
+    fn request_ocsp_response(&self) -> bool;
+
+    /// Returns which [`CertificateType`]s this verifier supports.
+    ///
+    /// Returning an empty slice will result in an error. The default implementation signals
+    /// support for X.509 certificates. Implementations should return the same value every time.
+    ///
+    /// See [RFC 7250](https://www.rfc-editor.org/info/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::X509]
+    }
+
+    /// Return the [`DistinguishedName`]s of certificate authorities that this verifier trusts.
+    ///
+    /// If specified, will be sent as the [`certificate_authorities`] extension in ClientHello.
+    /// Note that this is only applicable to TLS 1.3.
+    ///
+    /// [`certificate_authorities`]: https://www.rfc-editor.org/info/rfc9846#section-4.3.4
+    fn root_hint_subjects(&self) -> Option<Arc<[DistinguishedName]>> {
+        None
+    }
+
+    /// Instance configuration should be input to `h`.
+    fn hash_config(&self, h: &mut dyn Hasher);
+}
+
+/// Data required to verify a server's identity.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ServerIdentity<'a, 'b> {
+    /// Identity information presented by the server.
+    pub identity: &'b Identity<'a>,
+    /// The server name the client specified when connecting to the server.
+    pub server_name: &'b ServerName<'a>,
+    /// OCSP response stapled to the server's `Certificate` message, if any.
+    ///
+    /// Empty if no OCSP response was received, and that also
+    /// covers the case where `request_ocsp_response()` returns false.
+    pub ocsp_response: &'b [u8],
+    /// Current time against which time-sensitive inputs should be validated.
+    pub now: UnixTime,
+}
+
+impl<'a, 'b> ServerIdentity<'a, 'b> {
+    /// Create a new `ServerIdentity` instance with empty OCSP response.
+    pub fn new(identity: &'b Identity<'a>, server_name: &'b ServerName<'a>, now: UnixTime) -> Self {
+        Self {
+            identity,
+            server_name,
+            ocsp_response: &[],
+            now,
+        }
     }
 }
 
 /// Something that can verify a client certificate chain
-pub trait ClientCertVerifier: Send + Sync {
+pub trait ClientVerifier: Debug + Send + Sync {
+    /// Verify the client's identity.
+    ///
+    /// Note that none of the certificates have been parsed yet, so it is the responsibility of
+    /// the implementer to handle invalid data. It is recommended that the implementer returns
+    /// a [`CertificateError::BadEncoding`] error when these cases are encountered.
+    ///
+    /// [`CertificateError::BadEncoding`]: crate::error::CertificateError::BadEncoding
+    fn verify_identity<'a>(
+        &self,
+        identity: &ClientIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error>;
+
+    /// Verify a signature allegedly by the given client certificate.
+    ///
+    /// If and only if the signature is valid, return `Ok(HandshakeSignatureValid)`.
+    /// Otherwise, return an error -- rustls will send an alert and abort the
+    /// connection.
+    ///
+    /// This method is only called for TLS1.2 handshakes.  Note that, in TLS1.2,
+    /// SignatureSchemes such as `SignatureScheme::ECDSA_NISTP256_SHA256` are not
+    /// in fact bound to the specific curve implied in their name.
+    fn verify_tls12_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error>;
+
+    /// Verify a signature allegedly by the given client certificate.
+    ///
+    /// This method is only called for TLS1.3 handshakes.
+    ///
+    /// This method is very similar to `verify_tls12_signature`, but note the
+    /// tighter ECDSA SignatureScheme semantics in TLS 1.3. For example,
+    /// `SignatureScheme::ECDSA_NISTP256_SHA256`
+    /// must only validate signatures using public keys on the right curve --
+    /// rustls does not enforce this requirement for you.
+    fn verify_tls13_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error>;
+
+    /// Returns the [`DistinguishedName`] [subjects] that the server will hint to clients to
+    /// identify acceptable authentication trust anchors.
+    ///
+    /// These hint values help the client pick a client certificate it believes the server will
+    /// accept. The hints must be DER-encoded X.500 distinguished names, per [RFC 5280 A.1]. They
+    /// are sent in the [`certificate_authorities`] extension of a [`CertificateRequest`] message
+    /// when [ClientVerifier::offer_client_auth] is true. When an empty list is sent the client
+    /// should always provide a client certificate if it has one.
+    ///
+    /// Generally this list should contain the [`DistinguishedName`] of each root trust
+    /// anchor in the root cert store that the server is configured to use for authenticating
+    /// presented client certificates.
+    ///
+    /// In some circumstances this list may be customized to include [`DistinguishedName`] entries
+    /// that do not correspond to a trust anchor in the server's root cert store. For example,
+    /// the server may be configured to trust a root CA that cross-signed an issuer certificate
+    /// that the client considers a trust anchor. From the server's perspective the cross-signed
+    /// certificate is an intermediate, and not present in the server's root cert store. The client
+    /// may have the cross-signed certificate configured as a trust anchor, and be unaware of the
+    /// root CA that cross-signed it. If the server's hints list only contained the subjects of the
+    /// server's root store the client would consider a client certificate issued by the cross-signed
+    /// issuer unacceptable, since its subject was not hinted. To avoid this circumstance the server
+    /// should customize the hints list to include the subject of the cross-signed issuer in addition
+    /// to the subjects from the root cert store.
+    ///
+    /// [subjects]: https://www.rfc-editor.org/info/rfc5280#section-4.1.2.6
+    /// [RFC 5280 A.1]: https://www.rfc-editor.org/info/rfc5280#appendix-A.1
+    /// [`CertificateRequest`]: https://www.rfc-editor.org/info/rfc9846#section-4.4.2
+    /// [`certificate_authorities`]: https://www.rfc-editor.org/info/rfc9846#section-4.3.4
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]>;
+
+    /// Return `true` to require a client certificate and `false` to make
+    /// client authentication optional.
+    /// Defaults to `self.offer_client_auth()`.
+    fn client_auth_mandatory(&self) -> bool {
+        self.offer_client_auth()
+    }
+
     /// Returns `true` to enable the server to request a client certificate and
     /// `false` to skip requesting a client certificate. Defaults to `true`.
     fn offer_client_auth(&self) -> bool {
         true
     }
 
-    /// Return `Some(true)` to require a client certificate and `Some(false)` to make
-    /// client authentication optional. Return `None` to abort the connection.
-    /// Defaults to `Some(self.offer_client_auth())`.
-    ///
-    /// `sni` is the server name quoted by the client in its ClientHello; it has
-    /// been validated as a proper DNS name but is otherwise untrusted.
-    fn client_auth_mandatory(&self, _sni: Option<&webpki::DNSName>) -> Option<bool> {
-        Some(self.offer_client_auth())
-    }
-
-    /// Returns the subject names of the client authentication trust anchors to
-    /// share with the client when requesting client authentication.
-    ///
-    /// Return `None` to abort the connection.
-    ///
-    /// `sni` is the server name quoted by the client in its ClientHello; it has
-    /// been validated as a proper DNS name but is otherwise untrusted.
-    fn client_auth_root_subjects(
-        &self,
-        sni: Option<&webpki::DNSName>,
-    ) -> Option<DistinguishedNames>;
-
-    /// Verify the end-entity certificate `end_entity` is valid for the
-    /// and chains to at least one of the trust anchors in `roots`.
-    ///
-    /// `intermediates` contains the intermediate certificates the
-    /// client sent along with the end-entity certificate; it is in the same
-    /// order that the peer sent them and may be empty.
-    ///
-    /// `sni` is the server name quoted by the client in its ClientHello; it has
-    /// been validated as a proper DNS name but is otherwise untrusted.
-    fn verify_client_cert(
-        &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        sni: Option<&webpki::DNSName>,
-        now: SystemTime,
-    ) -> Result<ClientCertVerified, TLSError>;
-
-    /// Verify a signature allegedly by the given server certificate.
-    ///
-    /// `message` is not hashed, and needs hashing during the verification.
-    /// The signature and algorithm are within `dss`.  `cert` contains the
-    /// public key to use.
-    ///
-    /// `cert` is the same certificate that was previously validated by a
-    /// call to `verify_server_cert`.
-    ///
-    /// If and only if the signature is valid, return HandshakeSignatureValid.
-    /// Otherwise, return an error -- rustls will send an alert and abort the
-    /// connection.
-    ///
-    /// This method is only called for TLS1.2 handshakes.  Note that, in TLS1.2,
-    /// SignatureSchemes such as `SignatureScheme::ECDSA_NISTP256_SHA256` are not
-    /// in fact bound to the specific curve implied in their name.
-    ///
-    /// This trait method has a default implementation that uses webpki to verify
-    /// the signature.
-    fn verify_tls12_signature(
-        &self,
-        message: &[u8],
-        cert: &Certificate,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TLSError> {
-        verify_signed_struct(message, cert, dss)
-    }
-
-
-    /// Verify a signature allegedly by the given server certificate.
-    ///
-    /// This method is only called for TLS1.3 handshakes.
-    ///
-    /// This method is very similar to `verify_tls12_signature`: but note the
-    /// tighter ECDSA SignatureScheme semantics -- e.g. `SignatureScheme::ECDSA_NISTP256_SHA256`
-    /// must only validate signatures using public keys on the right curve --
-    /// rustls does not enforce this requirement for you.
-    ///
-    /// This trait method has a default implementation that uses webpki to verify
-    /// the signature.
-    fn verify_tls13_signature(
-        &self,
-        message: &[u8],
-        cert: &Certificate,
-        dss: &DigitallySignedStruct,
-    ) -> Result<HandshakeSignatureValid, TLSError> {
-        verify_tls13(message, cert, dss)
-    }
-
     /// Return the list of SignatureSchemes that this verifier will handle,
     /// in `verify_tls12_signature` and `verify_tls13_signature` calls.
     ///
     /// This should be in priority order, with the most preferred first.
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme>;
+
+    /// Returns which [`CertificateType`]s this verifier supports.
     ///
-    /// This trait method has a default implementation that reflects the schemes
-    /// supported by webpki.
-    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
-        WebPKIVerifier::verification_schemes()
-    }
-}
-
-impl ServerCertVerifier for WebPKIVerifier {
-    /// Will verify the certificate is valid in the following ways:
-    /// - Signed by a  trusted `RootCertStore` CA
-    /// - Not Expired
-    /// - Valid for DNS entry
-    /// - OCSP data is present
-    fn verify_server_cert(
-        &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        roots: &RootCertStore,
-        dns_name: webpki::DNSNameRef,
-        ocsp_response: &[u8],
-        now: SystemTime,
-    ) -> Result<ServerCertVerified, TLSError> {
-        let (cert, chain, trustroots) = prepare(end_entity, intermediates, roots)?;
-        let now = webpki::Time::try_from(now).map_err(|_| TLSError::FailedToGetCurrentTime)?;
-
-        let cert = cert
-            .verify_is_valid_tls_server_cert(
-                SUPPORTED_SIG_ALGS,
-                &webpki::TLSServerTrustAnchors(&trustroots),
-                &chain,
-                now,
-            )
-            .map_err(TLSError::WebPKIError)
-            .map(|_| cert)?;
-
-        if !ocsp_response.is_empty() {
-            trace!("Unvalidated OCSP response: {:?}", ocsp_response.to_vec());
-        }
-
-        cert.verify_is_valid_for_dns_name(dns_name)
-            .map_err(TLSError::WebPKIError)
-            .map(|_| ServerCertVerified::assertion())
-    }
-}
-
-/// Default `ServerCertVerifier`, see the trait impl for more information.
-pub struct WebPKIVerifier;
-
-impl WebPKIVerifier {
-    /// Returns the signature verification methods supported by
-    /// webpki.
-    pub fn verification_schemes() -> Vec<SignatureScheme> {
-        vec![
-            SignatureScheme::ECDSA_NISTP384_SHA384,
-            SignatureScheme::ECDSA_NISTP256_SHA256,
-            SignatureScheme::ED25519,
-            SignatureScheme::RSA_PSS_SHA512,
-            SignatureScheme::RSA_PSS_SHA384,
-            SignatureScheme::RSA_PSS_SHA256,
-            SignatureScheme::RSA_PKCS1_SHA512,
-            SignatureScheme::RSA_PKCS1_SHA384,
-            SignatureScheme::RSA_PKCS1_SHA256,
-        ]
-    }
-}
-
-type CertChainAndRoots<'a, 'b> = (
-    webpki::EndEntityCert<'a>,
-    Vec<&'a [u8]>,
-    Vec<webpki::TrustAnchor<'b>>,
-);
-
-fn prepare<'a, 'b>(
-    end_entity: &'a Certificate,
-    intermediates: &'a [Certificate],
-    roots: &'b RootCertStore,
-) -> Result<CertChainAndRoots<'a, 'b>, TLSError> {
-    // EE cert must appear first.
-    let cert = webpki::EndEntityCert::from(&end_entity.0).map_err(TLSError::WebPKIError)?;
-
-    let intermediates: Vec<&'a [u8]> = intermediates.iter().map(|cert| cert.0.as_ref()).collect();
-
-    let trustroots: Vec<webpki::TrustAnchor> = roots
-        .roots
-        .iter()
-        .map(OwnedTrustAnchor::to_trust_anchor)
-        .collect();
-
-    Ok((cert, intermediates, trustroots))
-}
-
-/// A `ClientCertVerifier` that will ensure that every client provides a trusted
-/// certificate, without any name checking.
-pub struct AllowAnyAuthenticatedClient {
-    roots: RootCertStore,
-}
-
-impl AllowAnyAuthenticatedClient {
-    /// Construct a new `AllowAnyAuthenticatedClient`.
+    /// Returning an empty slice will result in an error. The default implementation signals
+    /// support for X.509 certificates. Implementations should return the same value every time.
     ///
-    /// `roots` is the list of trust anchors to use for certificate validation.
-    pub fn new(roots: RootCertStore) -> Arc<dyn ClientCertVerifier> {
-        Arc::new(AllowAnyAuthenticatedClient { roots })
+    /// See [RFC 7250](https://www.rfc-editor.org/info/rfc7250) for more information.
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::X509]
     }
 }
 
-impl ClientCertVerifier for AllowAnyAuthenticatedClient {
-    fn offer_client_auth(&self) -> bool {
-        true
-    }
-
-    fn client_auth_mandatory(&self, _sni: Option<&webpki::DNSName>) -> Option<bool> {
-        Some(true)
-    }
-
-    fn client_auth_root_subjects(
-        &self,
-        _sni: Option<&webpki::DNSName>,
-    ) -> Option<DistinguishedNames> {
-        Some(self.roots.get_subjects())
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        _sni: Option<&webpki::DNSName>,
-        now: SystemTime,
-    ) -> Result<ClientCertVerified, TLSError> {
-        let (cert, chain, trustroots) = prepare(end_entity, intermediates, &self.roots)?;
-        let now = webpki::Time::try_from(now).map_err(|_| TLSError::FailedToGetCurrentTime)?;
-        cert.verify_is_valid_tls_client_cert(
-            SUPPORTED_SIG_ALGS,
-            &webpki::TLSClientTrustAnchors(&trustroots),
-            &chain,
-            now,
-        )
-        .map_err(TLSError::WebPKIError)
-        .map(|_| ClientCertVerified::assertion())
-    }
+/// Data required to verify a client's identity.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct ClientIdentity<'a, 'b> {
+    /// Identity information presented by the client.
+    pub identity: &'b Identity<'a>,
+    /// Current time against which time-sensitive inputs should be validated.
+    pub now: UnixTime,
 }
 
-/// A `ClientCertVerifier` that will allow both anonymous and authenticated
-/// clients, without any name checking.
+/// Input for message signature verification.
+#[non_exhaustive]
+#[derive(Debug)]
+pub struct SignatureVerificationInput<'a> {
+    /// The message is not hashed, and needs hashing during verification.
+    pub message: &'a [u8],
+    /// The public key to use.
+    ///
+    /// `signer` has already been validated by the point this is called.
+    pub signer: &'a SignerPublicKey<'a>,
+    /// The signature scheme and payload.
+    pub signature: &'a DigitallySignedStruct,
+}
+
+/// Public key used to verify a signature.
 ///
-/// Client authentication will be requested during the TLS handshake. If the
-/// client offers a certificate then this acts like
-/// `AllowAnyAuthenticatedClient`, otherwise this acts like `NoClientAuth`.
-pub struct AllowAnyAnonymousOrAuthenticatedClient {
-    inner: AllowAnyAuthenticatedClient,
-}
-
-impl AllowAnyAnonymousOrAuthenticatedClient {
-    /// Construct a new `AllowAnyAnonymousOrAuthenticatedClient`.
-    ///
-    /// `roots` is the list of trust anchors to use for certificate validation.
-    pub fn new(roots: RootCertStore) -> Arc<dyn ClientCertVerifier> {
-        Arc::new(AllowAnyAnonymousOrAuthenticatedClient {
-            inner: AllowAnyAuthenticatedClient { roots },
-        })
-    }
-}
-
-impl ClientCertVerifier for AllowAnyAnonymousOrAuthenticatedClient {
-    fn offer_client_auth(&self) -> bool {
-        self.inner.offer_client_auth()
-    }
-
-    fn client_auth_mandatory(&self, _sni: Option<&webpki::DNSName>) -> Option<bool> {
-        Some(false)
-    }
-
-    fn client_auth_root_subjects(
-        &self,
-        sni: Option<&webpki::DNSName>,
-    ) -> Option<DistinguishedNames> {
-        self.inner.client_auth_root_subjects(sni)
-    }
-
-    fn verify_client_cert(
-        &self,
-        end_entity: &Certificate,
-        intermediates: &[Certificate],
-        sni: Option<&webpki::DNSName>,
-        now: SystemTime,
-    ) -> Result<ClientCertVerified, TLSError> {
-        self.inner
-            .verify_client_cert(end_entity, intermediates, sni, now)
-    }
+/// Used as part of [`SignatureVerificationInput`].
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum SignerPublicKey<'a> {
+    /// An X.509 certificate for the signing peer.
+    X509(&'a CertificateDer<'a>),
+    /// A raw public key, as defined in [RFC 7250](https://www.rfc-editor.org/info/rfc7250).
+    RawPublicKey(&'a SubjectPublicKeyInfoDer<'a>),
 }
 
 /// Turns off client authentication.
+///
+/// In contrast to using
+/// `WebPkiClientVerifier::builder(roots, provider).allow_unauthenticated().build()`, the [`NoClientAuth`]
+/// [`ClientVerifier`] will not offer client authentication at all, versus offering but not
+/// requiring it.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Debug)]
 pub struct NoClientAuth;
 
-impl NoClientAuth {
-    /// Constructs a `NoClientAuth` and wraps it in an `Arc`.
-    pub fn new() -> Arc<dyn ClientCertVerifier> {
-        Arc::new(NoClientAuth)
+impl ClientVerifier for NoClientAuth {
+    fn verify_identity<'a>(
+        &self,
+        _identity: &ClientIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        unimplemented!();
     }
-}
 
-impl ClientCertVerifier for NoClientAuth {
+    fn verify_tls12_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unimplemented!();
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unimplemented!();
+    }
+
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
+        unimplemented!();
+    }
+
     fn offer_client_auth(&self) -> bool {
         false
     }
 
-    fn client_auth_root_subjects(
-        &self,
-        _sni: Option<&webpki::DNSName>,
-    ) -> Option<DistinguishedNames> {
-        unimplemented!();
-    }
-
-    fn verify_client_cert(
-        &self,
-        _end_entity: &Certificate,
-        _intermediates: &[Certificate],
-        _sni: Option<&webpki::DNSName>,
-        _now: SystemTime,
-    ) -> Result<ClientCertVerified, TLSError> {
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
         unimplemented!();
     }
 }
 
-static ECDSA_SHA256: SignatureAlgorithms =
-    &[&webpki::ECDSA_P256_SHA256, &webpki::ECDSA_P384_SHA256];
-
-static ECDSA_SHA384: SignatureAlgorithms =
-    &[&webpki::ECDSA_P256_SHA384, &webpki::ECDSA_P384_SHA384];
-
-static ED25519: SignatureAlgorithms = &[&webpki::ED25519];
-
-static RSA_SHA256: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA256];
-static RSA_SHA384: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA384];
-static RSA_SHA512: SignatureAlgorithms = &[&webpki::RSA_PKCS1_2048_8192_SHA512];
-static RSA_PSS_SHA256: SignatureAlgorithms = &[&webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY];
-static RSA_PSS_SHA384: SignatureAlgorithms = &[&webpki::RSA_PSS_2048_8192_SHA384_LEGACY_KEY];
-static RSA_PSS_SHA512: SignatureAlgorithms = &[&webpki::RSA_PSS_2048_8192_SHA512_LEGACY_KEY];
-
-fn convert_scheme(scheme: SignatureScheme) -> Result<SignatureAlgorithms, TLSError> {
-    match scheme {
-        // nb. for TLS1.2 the curve is not fixed by SignatureScheme.
-        SignatureScheme::ECDSA_NISTP256_SHA256 => Ok(ECDSA_SHA256),
-        SignatureScheme::ECDSA_NISTP384_SHA384 => Ok(ECDSA_SHA384),
-
-        SignatureScheme::ED25519 => Ok(ED25519),
-
-        SignatureScheme::RSA_PKCS1_SHA256 => Ok(RSA_SHA256),
-        SignatureScheme::RSA_PKCS1_SHA384 => Ok(RSA_SHA384),
-        SignatureScheme::RSA_PKCS1_SHA512 => Ok(RSA_SHA512),
-
-        SignatureScheme::RSA_PSS_SHA256 => Ok(RSA_PSS_SHA256),
-        SignatureScheme::RSA_PSS_SHA384 => Ok(RSA_PSS_SHA384),
-        SignatureScheme::RSA_PSS_SHA512 => Ok(RSA_PSS_SHA512),
-
-        _ => {
-            let error_msg = format!("received unadvertised sig scheme {:?}", scheme);
-            Err(TLSError::PeerMisbehavedError(error_msg))
-        }
-    }
+/// This type combines a [`SignatureScheme`] and a signature payload produced with that scheme.
+#[derive(Debug, Clone)]
+pub struct DigitallySignedStruct {
+    /// The [`SignatureScheme`] used to produce the signature.
+    pub scheme: SignatureScheme,
+    sig: SizedPayload<'static, u16, MaybeEmpty>,
 }
 
-fn verify_sig_using_any_alg(
-    cert: &webpki::EndEntityCert,
-    algs: SignatureAlgorithms,
-    message: &[u8],
-    sig: &[u8],
-) -> Result<(), webpki::Error> {
-    // TLS doesn't itself give us enough info to map to a single webpki::SignatureAlgorithm.
-    // Therefore, convert_algs maps to several and we try them all.
-    for alg in algs {
-        match cert.verify_signature(alg, message, sig) {
-            Err(webpki::Error::UnsupportedSignatureAlgorithmForPublicKey) => continue,
-            res => return res,
+impl DigitallySignedStruct {
+    pub(crate) fn new(scheme: SignatureScheme, sig: Vec<u8>) -> Self {
+        Self {
+            scheme,
+            sig: SizedPayload::from(Payload::new(sig)),
         }
     }
 
-    Err(webpki::Error::UnsupportedSignatureAlgorithmForPublicKey)
-}
-
-fn verify_signed_struct(
-    message: &[u8],
-    cert: &Certificate,
-    dss: &DigitallySignedStruct,
-) -> Result<HandshakeSignatureValid, TLSError> {
-    let possible_algs = convert_scheme(dss.scheme)?;
-    let cert = webpki::EndEntityCert::from(&cert.0).map_err(TLSError::WebPKIError)?;
-
-    verify_sig_using_any_alg(&cert, possible_algs, message, &dss.sig.0)
-        .map_err(TLSError::WebPKIError)
-        .map(|_| HandshakeSignatureValid::assertion())
-}
-
-fn convert_alg_tls13(
-    scheme: SignatureScheme,
-) -> Result<&'static webpki::SignatureAlgorithm, TLSError> {
-    use crate::msgs::enums::SignatureScheme::*;
-
-    match scheme {
-        ECDSA_NISTP256_SHA256 => Ok(&webpki::ECDSA_P256_SHA256),
-        ECDSA_NISTP384_SHA384 => Ok(&webpki::ECDSA_P384_SHA384),
-        ED25519 => Ok(&webpki::ED25519),
-        RSA_PSS_SHA256 => Ok(&webpki::RSA_PSS_2048_8192_SHA256_LEGACY_KEY),
-        RSA_PSS_SHA384 => Ok(&webpki::RSA_PSS_2048_8192_SHA384_LEGACY_KEY),
-        RSA_PSS_SHA512 => Ok(&webpki::RSA_PSS_2048_8192_SHA512_LEGACY_KEY),
-        _ => {
-            let error_msg = format!("received unsupported sig scheme {:?}", scheme);
-            Err(TLSError::PeerMisbehavedError(error_msg))
-        }
+    /// Get the signature.
+    pub fn signature(&self) -> &[u8] {
+        self.sig.bytes()
     }
 }
 
-/// Constructs the signature message specified in section 4.4.3 of RFC8446.
-pub fn construct_tls13_client_verify_message(handshake_hash: &Digest) -> Vec<u8> {
-    construct_tls13_verify_message(handshake_hash, b"TLS 1.3, client CertificateVerify\x00")
-}
+impl Codec<'_> for DigitallySignedStruct {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.scheme.encode(bytes);
+        self.sig.encode(bytes);
+    }
 
-/// Constructs the signature message specified in section 4.4.3 of RFC8446.
-pub fn construct_tls13_server_verify_message(handshake_hash: &Digest) -> Vec<u8> {
-    construct_tls13_verify_message(handshake_hash, b"TLS 1.3, server CertificateVerify\x00")
-}
-
-fn construct_tls13_verify_message(handshake_hash: &Digest, context_string_with_0: &[u8]) -> Vec<u8> {
-    let mut msg = Vec::new();
-    msg.resize(64, 0x20u8);
-    msg.extend_from_slice(context_string_with_0);
-    msg.extend_from_slice(handshake_hash.as_ref());
-    msg
-}
-
-fn verify_tls13(
-    msg: &[u8],
-    cert: &Certificate,
-    dss: &DigitallySignedStruct,
-) -> Result<HandshakeSignatureValid, TLSError> {
-    let alg = convert_alg_tls13(dss.scheme)?;
-
-
-    let cert = webpki::EndEntityCert::from(&cert.0).map_err(TLSError::WebPKIError)?;
-
-    cert.verify_signature(alg, &msg, &dss.sig.0)
-        .map_err(TLSError::WebPKIError)
-        .map(|_| HandshakeSignatureValid::assertion())
-}
-
-fn unix_time_millis(now: SystemTime) -> Result<u64, TLSError> {
-    now
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|dur| dur.as_secs())
-        .map_err(|_| TLSError::FailedToGetCurrentTime)
-        .and_then(|secs| {
-            secs.checked_mul(1000)
-                .ok_or(TLSError::FailedToGetCurrentTime)
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            scheme: SignatureScheme::read(r)?,
+            sig: SizedPayload::read(r)?.into_owned(),
         })
+    }
 }
 
-pub fn verify_scts(cert: &Certificate, now: SystemTime, scts: &SCTList, logs: &[&sct::Log]) -> Result<(), TLSError> {
-    let mut valid_scts = 0;
-    let now = unix_time_millis(now)?;
-    let mut last_sct_error = None;
+wrapped_payload!(
+    /// A `DistinguishedName` is a `Vec<u8>` wrapped in internal types.
+    ///
+    /// It contains the DER or BER encoded [`Subject` field from RFC 5280](https://www.rfc-editor.org/info/rfc5280#section-4.1.2.6)
+    /// for a single certificate. The Subject field is [encoded as an RFC 5280 `Name`](https://www.rfc-editor.org/info/rfc5280#page-116).
+    /// It can be decoded using [x509-parser's FromDer trait](https://docs.rs/x509-parser/latest/x509_parser/prelude/trait.FromDer.html).
+    ///
+    /// ```ignore
+    /// for name in distinguished_names {
+    ///     use x509_parser::prelude::FromDer;
+    ///     println!("{}", x509_parser::x509::X509Name::from_der(&name.0)?.1);
+    /// }
+    /// ```
+    ///
+    /// The TLS encoding is defined in RFC 5246: `opaque DistinguishedName<1..2^16-1>;`
+    pub struct DistinguishedName,
+    SizedPayload<u16, NonEmpty>,
+);
 
-    for sct in scts {
-        #[cfg_attr(not(feature = "logging"), allow(unused_variables))]
-        match sct::verify_sct(&cert.0, &sct.0, now, logs) {
-            Ok(index) => {
-                debug!(
-                    "Valid SCT signed by {} on {}",
-                    logs[index].operated_by, logs[index].description
-                );
-                valid_scts += 1;
-            }
-            Err(e) => {
-                if e.should_be_fatal() {
-                    return Err(TLSError::InvalidSCT(e));
-                }
-                debug!("SCT ignored because {:?}", e);
-                last_sct_error = Some(e);
-            }
-        }
+impl DistinguishedName {
+    /// Create a [`DistinguishedName`] after prepending its outer SEQUENCE encoding.
+    ///
+    /// This can be decoded using [x509-parser's FromDer trait](https://docs.rs/x509-parser/latest/x509_parser/prelude/trait.FromDer.html).
+    ///
+    /// ```ignore
+    /// use x509_parser::prelude::FromDer;
+    /// println!("{}", x509_parser::x509::X509Name::from_der(dn.as_ref())?.1);
+    /// ```
+    pub fn in_sequence(bytes: &[u8]) -> Self {
+        Self(SizedPayload::from(Payload::new(wrap_in_sequence(bytes))))
+    }
+}
+
+impl PartialEq for DistinguishedName {
+    fn eq(&self, other: &Self) -> bool {
+        self.0.bytes() == other.0.bytes()
+    }
+}
+
+/// RFC 9846: `DistinguishedName authorities<3..2^16-1>;` however,
+/// RFC 5246: `DistinguishedName certificate_authorities<0..2^16-1>;`
+impl TlsListElement for DistinguishedName {
+    const SIZE_LEN: ListLength = ListLength::U16;
+}
+
+/// Zero-sized marker type representing verification of a signature.
+#[derive(Debug)]
+pub struct HandshakeSignatureValid(());
+
+impl HandshakeSignatureValid {
+    /// Make a `HandshakeSignatureValid`
+    pub fn assertion() -> Self {
+        Self(())
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct FinishedMessageVerified(());
+
+impl FinishedMessageVerified {
+    pub(crate) fn assertion() -> Self {
+        Self(())
+    }
+}
+
+/// Zero-sized marker type representing verification of the peer's identity.
+#[derive(Debug)]
+pub(crate) struct PeerVerified(());
+
+/// A peer's identity, which has been verified.
+#[derive(Clone, Debug, Eq, Hash, PartialEq)]
+pub struct VerifiedIdentity<'a>(Identity<'a>);
+
+impl<'a> VerifiedIdentity<'a> {
+    /// Make a `VerifiedIdentity`, noting that `identity` has been verified somehow.
+    pub fn assertion(identity: Identity<'a>) -> Self {
+        VerifiedIdentity(identity)
     }
 
-    /* If we were supplied with some logs, and some SCTs,
-     * but couldn't verify any of them, fail the handshake. */
-    if !logs.is_empty() && !scts.is_empty() && valid_scts == 0 {
-        warn!("No valid SCTs provided");
-        return Err(TLSError::InvalidSCT(last_sct_error.unwrap()));
+    /// Borrow the verified [`Identity`].
+    pub fn identity(&self) -> &Identity<'a> {
+        &self.0
     }
 
-    Ok(())
+    /// Convert the value into an owned one.
+    ///
+    /// This is a straight move if the value is already owned.
+    pub fn into_owned(self) -> VerifiedIdentity<'static> {
+        VerifiedIdentity(self.0.into_owned())
+    }
+
+    pub(crate) fn as_marker(&self) -> PeerVerified {
+        PeerVerified(())
+    }
+
+    pub(crate) fn into_inner(self) -> Identity<'a> {
+        self.0
+    }
+}
+
+impl PartialEq<Identity<'_>> for VerifiedIdentity<'_> {
+    fn eq(&self, other: &Identity<'_>) -> bool {
+        self.0 == *other
+    }
+}
+
+impl<'a> Deref for VerifiedIdentity<'a> {
+    type Target = Identity<'a>;
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
+#[test]
+fn assertions_are_debug() {
+    use std::format;
+
+    assert_eq!(format!("{:?}", PeerVerified(())), "PeerVerified(())");
+    assert_eq!(
+        format!("{:?}", HandshakeSignatureValid::assertion()),
+        "HandshakeSignatureValid(())"
+    );
+    assert_eq!(
+        format!("{:?}", FinishedMessageVerified::assertion()),
+        "FinishedMessageVerified(())"
+    );
 }

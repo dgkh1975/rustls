@@ -1,0 +1,2689 @@
+use core::hash::Hasher;
+use core::{fmt, mem};
+use std::borrow::Cow;
+use std::io;
+use std::sync::{Arc, Mutex, OnceLock};
+
+use rustls::client::danger::{HandshakeSignatureValid, ServerIdentity, ServerVerifier};
+use rustls::client::{
+    ClientSessionKey, ServerVerifierBuilder, Tls13Session, WantsClientCert, WebPkiServerVerifier,
+};
+use rustls::crypto::cipher::{
+    EncodableVersion, InboundOpaque, Payload, Record, RecordDecrypter, RecordEncrypter,
+};
+use rustls::crypto::kx::{NamedGroup, SupportedKxGroup};
+use rustls::crypto::{
+    CipherSuite, Credentials, CryptoProvider, Identity, InconsistentKeys, SelectedCredential,
+    SignatureScheme, SigningKey, SingleCredential, VerifiedIdentity, WebPkiSupportedAlgorithms,
+    verify_tls13_signature,
+};
+use rustls::enums::{CertificateType, ContentType, ProtocolVersion};
+use rustls::error::{CertificateError, Error};
+use rustls::pki_types::pem::PemObject;
+use rustls::pki_types::{
+    CertificateDer, CertificateRevocationListDer, DnsName, PrivateKeyDer, PrivatePkcs8KeyDer,
+    ServerName, SubjectPublicKeyInfoDer,
+};
+use rustls::server::danger::{ClientIdentity, ClientVerifier, SignatureVerificationInput};
+use rustls::server::{
+    ClientHello, ClientVerifierBuilder, ServerCredentialResolver, WebPkiClientVerifier,
+};
+use rustls::{
+    ClientConfig, ClientSide, ConfigBuilder, Connection, ConnectionTrafficSecrets,
+    DistinguishedName, MessageHandler, RootCertStore, ServerConfig, ServerSide, SideData,
+    SupportedCipherSuite, Tcp, VecInput, WantsVerifier,
+};
+use tracing::{Event, Level, Metadata, field, span, subscriber};
+
+macro_rules! embed_files {
+    (
+        $(
+            ($name:ident, $keytype:expr, $path:expr);
+        )+
+    ) => {
+        $(
+            const $name: &'static [u8] = include_bytes!(
+                concat!("../../test-ca/", $keytype, "/", $path));
+        )+
+
+        pub fn bytes_for(keytype: &str, path: &str) -> &'static [u8] {
+            match (keytype, path) {
+                $(
+                    ($keytype, $path) => $name,
+                )+
+                _ => panic!("unknown keytype {} with path {}", keytype, path),
+            }
+        }
+    }
+}
+
+embed_files! {
+    (ECDSA_P256_END_PEM_SPKI, "ecdsa-p256", "end.spki.pem");
+    (ECDSA_P256_CLIENT_PEM_SPKI, "ecdsa-p256", "client.spki.pem");
+    (ECDSA_P256_CA_CERT, "ecdsa-p256", "ca.cert");
+    (ECDSA_P256_CA_DER, "ecdsa-p256", "ca.der");
+    (ECDSA_P256_CA_KEY, "ecdsa-p256", "ca.key");
+    (ECDSA_P256_CLIENT_CERT, "ecdsa-p256", "client.cert");
+    (ECDSA_P256_CLIENT_CHAIN, "ecdsa-p256", "client.chain");
+    (ECDSA_P256_CLIENT_FULLCHAIN, "ecdsa-p256", "client.fullchain");
+    (ECDSA_P256_CLIENT_KEY, "ecdsa-p256", "client.key");
+    (ECDSA_P256_END_CRL_PEM, "ecdsa-p256", "end.revoked.crl.pem");
+    (ECDSA_P256_CLIENT_CRL_PEM, "ecdsa-p256", "client.revoked.crl.pem");
+    (ECDSA_P256_INTERMEDIATE_CRL_PEM, "ecdsa-p256", "inter.revoked.crl.pem");
+    (ECDSA_P256_EXPIRED_CRL_PEM, "ecdsa-p256", "end.expired.crl.pem");
+    (ECDSA_P256_END_CERT, "ecdsa-p256", "end.cert");
+    (ECDSA_P256_END_CHAIN, "ecdsa-p256", "end.chain");
+    (ECDSA_P256_END_FULLCHAIN, "ecdsa-p256", "end.fullchain");
+    (ECDSA_P256_END_KEY, "ecdsa-p256", "end.key");
+    (ECDSA_P256_INTER_CERT, "ecdsa-p256", "inter.cert");
+    (ECDSA_P256_INTER_KEY, "ecdsa-p256", "inter.key");
+
+    (ECDSA_P384_END_PEM_SPKI, "ecdsa-p384", "end.spki.pem");
+    (ECDSA_P384_CLIENT_PEM_SPKI, "ecdsa-p384", "client.spki.pem");
+    (ECDSA_P384_CA_CERT, "ecdsa-p384", "ca.cert");
+    (ECDSA_P384_CA_DER, "ecdsa-p384", "ca.der");
+    (ECDSA_P384_CA_KEY, "ecdsa-p384", "ca.key");
+    (ECDSA_P384_CLIENT_CERT, "ecdsa-p384", "client.cert");
+    (ECDSA_P384_CLIENT_CHAIN, "ecdsa-p384", "client.chain");
+    (ECDSA_P384_CLIENT_FULLCHAIN, "ecdsa-p384", "client.fullchain");
+    (ECDSA_P384_CLIENT_KEY, "ecdsa-p384", "client.key");
+    (ECDSA_P384_END_CRL_PEM, "ecdsa-p384", "end.revoked.crl.pem");
+    (ECDSA_P384_CLIENT_CRL_PEM, "ecdsa-p384", "client.revoked.crl.pem");
+    (ECDSA_P384_INTERMEDIATE_CRL_PEM, "ecdsa-p384", "inter.revoked.crl.pem");
+    (ECDSA_P384_EXPIRED_CRL_PEM, "ecdsa-p384", "end.expired.crl.pem");
+    (ECDSA_P384_END_CERT, "ecdsa-p384", "end.cert");
+    (ECDSA_P384_END_CHAIN, "ecdsa-p384", "end.chain");
+    (ECDSA_P384_END_FULLCHAIN, "ecdsa-p384", "end.fullchain");
+    (ECDSA_P384_END_KEY, "ecdsa-p384", "end.key");
+    (ECDSA_P384_INTER_CERT, "ecdsa-p384", "inter.cert");
+    (ECDSA_P384_INTER_KEY, "ecdsa-p384", "inter.key");
+
+    (ECDSA_P521_END_PEM_SPKI, "ecdsa-p521", "end.spki.pem");
+    (ECDSA_P521_CLIENT_PEM_SPKI, "ecdsa-p521", "client.spki.pem");
+    (ECDSA_P521_CA_CERT, "ecdsa-p521", "ca.cert");
+    (ECDSA_P521_CA_DER, "ecdsa-p521", "ca.der");
+    (ECDSA_P521_CA_KEY, "ecdsa-p521", "ca.key");
+    (ECDSA_P521_CLIENT_CERT, "ecdsa-p521", "client.cert");
+    (ECDSA_P521_CLIENT_CHAIN, "ecdsa-p521", "client.chain");
+    (ECDSA_P521_CLIENT_FULLCHAIN, "ecdsa-p521", "client.fullchain");
+    (ECDSA_P521_CLIENT_KEY, "ecdsa-p521", "client.key");
+    (ECDSA_P521_END_CRL_PEM, "ecdsa-p521", "end.revoked.crl.pem");
+    (ECDSA_P521_CLIENT_CRL_PEM, "ecdsa-p521", "client.revoked.crl.pem");
+    (ECDSA_P521_INTERMEDIATE_CRL_PEM, "ecdsa-p521", "inter.revoked.crl.pem");
+    (ECDSA_P521_EXPIRED_CRL_PEM, "ecdsa-p521", "end.expired.crl.pem");
+    (ECDSA_P521_END_CERT, "ecdsa-p521", "end.cert");
+    (ECDSA_P521_END_CHAIN, "ecdsa-p521", "end.chain");
+    (ECDSA_P521_END_FULLCHAIN, "ecdsa-p521", "end.fullchain");
+    (ECDSA_P521_END_KEY, "ecdsa-p521", "end.key");
+    (ECDSA_P521_INTER_CERT, "ecdsa-p521", "inter.cert");
+    (ECDSA_P521_INTER_KEY, "ecdsa-p521", "inter.key");
+
+    (EDDSA_END_PEM_SPKI, "eddsa", "end.spki.pem");
+    (EDDSA_CLIENT_PEM_SPKI, "eddsa", "client.spki.pem");
+    (EDDSA_CA_CERT, "eddsa", "ca.cert");
+    (EDDSA_CA_DER, "eddsa", "ca.der");
+    (EDDSA_CA_KEY, "eddsa", "ca.key");
+    (EDDSA_CLIENT_CERT, "eddsa", "client.cert");
+    (EDDSA_CLIENT_CHAIN, "eddsa", "client.chain");
+    (EDDSA_CLIENT_FULLCHAIN, "eddsa", "client.fullchain");
+    (EDDSA_CLIENT_KEY, "eddsa", "client.key");
+    (EDDSA_END_CRL_PEM, "eddsa", "end.revoked.crl.pem");
+    (EDDSA_CLIENT_CRL_PEM, "eddsa", "client.revoked.crl.pem");
+    (EDDSA_INTERMEDIATE_CRL_PEM, "eddsa", "inter.revoked.crl.pem");
+    (EDDSA_EXPIRED_CRL_PEM, "eddsa", "end.expired.crl.pem");
+    (EDDSA_END_CERT, "eddsa", "end.cert");
+    (EDDSA_END_CHAIN, "eddsa", "end.chain");
+    (EDDSA_END_FULLCHAIN, "eddsa", "end.fullchain");
+    (EDDSA_END_KEY, "eddsa", "end.key");
+    (EDDSA_INTER_CERT, "eddsa", "inter.cert");
+    (EDDSA_INTER_KEY, "eddsa", "inter.key");
+
+    (RSA_2048_END_PEM_SPKI, "rsa-2048", "end.spki.pem");
+    (RSA_2048_CLIENT_PEM_SPKI, "rsa-2048", "client.spki.pem");
+    (RSA_2048_CA_CERT, "rsa-2048", "ca.cert");
+    (RSA_2048_CA_DER, "rsa-2048", "ca.der");
+    (RSA_2048_CA_KEY, "rsa-2048", "ca.key");
+    (RSA_2048_CLIENT_CERT, "rsa-2048", "client.cert");
+    (RSA_2048_CLIENT_CHAIN, "rsa-2048", "client.chain");
+    (RSA_2048_CLIENT_FULLCHAIN, "rsa-2048", "client.fullchain");
+    (RSA_2048_CLIENT_KEY, "rsa-2048", "client.key");
+    (RSA_2048_END_CRL_PEM, "rsa-2048", "end.revoked.crl.pem");
+    (RSA_2048_CLIENT_CRL_PEM, "rsa-2048", "client.revoked.crl.pem");
+    (RSA_2048_INTERMEDIATE_CRL_PEM, "rsa-2048", "inter.revoked.crl.pem");
+    (RSA_2048_EXPIRED_CRL_PEM, "rsa-2048", "end.expired.crl.pem");
+    (RSA_2048_END_CERT, "rsa-2048", "end.cert");
+    (RSA_2048_END_CHAIN, "rsa-2048", "end.chain");
+    (RSA_2048_END_FULLCHAIN, "rsa-2048", "end.fullchain");
+    (RSA_2048_END_KEY, "rsa-2048", "end.key");
+    (RSA_2048_INTER_CERT, "rsa-2048", "inter.cert");
+    (RSA_2048_INTER_KEY, "rsa-2048", "inter.key");
+
+    (RSA_3072_END_PEM_SPKI, "rsa-3072", "end.spki.pem");
+    (RSA_3072_CLIENT_PEM_SPKI, "rsa-3072", "client.spki.pem");
+    (RSA_3072_CA_CERT, "rsa-3072", "ca.cert");
+    (RSA_3072_CA_DER, "rsa-3072", "ca.der");
+    (RSA_3072_CA_KEY, "rsa-3072", "ca.key");
+    (RSA_3072_CLIENT_CERT, "rsa-3072", "client.cert");
+    (RSA_3072_CLIENT_CHAIN, "rsa-3072", "client.chain");
+    (RSA_3072_CLIENT_FULLCHAIN, "rsa-3072", "client.fullchain");
+    (RSA_3072_CLIENT_KEY, "rsa-3072", "client.key");
+    (RSA_3072_END_CRL_PEM, "rsa-3072", "end.revoked.crl.pem");
+    (RSA_3072_CLIENT_CRL_PEM, "rsa-3072", "client.revoked.crl.pem");
+    (RSA_3072_INTERMEDIATE_CRL_PEM, "rsa-3072", "inter.revoked.crl.pem");
+    (RSA_3072_EXPIRED_CRL_PEM, "rsa-3072", "end.expired.crl.pem");
+    (RSA_3072_END_CERT, "rsa-3072", "end.cert");
+    (RSA_3072_END_CHAIN, "rsa-3072", "end.chain");
+    (RSA_3072_END_FULLCHAIN, "rsa-3072", "end.fullchain");
+    (RSA_3072_END_KEY, "rsa-3072", "end.key");
+    (RSA_3072_INTER_CERT, "rsa-3072", "inter.cert");
+    (RSA_3072_INTER_KEY, "rsa-3072", "inter.key");
+
+    (RSA_4096_END_PEM_SPKI, "rsa-4096", "end.spki.pem");
+    (RSA_4096_CLIENT_PEM_SPKI, "rsa-4096", "client.spki.pem");
+    (RSA_4096_CA_CERT, "rsa-4096", "ca.cert");
+    (RSA_4096_CA_DER, "rsa-4096", "ca.der");
+    (RSA_4096_CA_KEY, "rsa-4096", "ca.key");
+    (RSA_4096_CLIENT_CERT, "rsa-4096", "client.cert");
+    (RSA_4096_CLIENT_CHAIN, "rsa-4096", "client.chain");
+    (RSA_4096_CLIENT_FULLCHAIN, "rsa-4096", "client.fullchain");
+    (RSA_4096_CLIENT_KEY, "rsa-4096", "client.key");
+    (RSA_4096_END_CRL_PEM, "rsa-4096", "end.revoked.crl.pem");
+    (RSA_4096_CLIENT_CRL_PEM, "rsa-4096", "client.revoked.crl.pem");
+    (RSA_4096_INTERMEDIATE_CRL_PEM, "rsa-4096", "inter.revoked.crl.pem");
+    (RSA_4096_EXPIRED_CRL_PEM, "rsa-4096", "end.expired.crl.pem");
+    (RSA_4096_END_CERT, "rsa-4096", "end.cert");
+    (RSA_4096_END_CHAIN, "rsa-4096", "end.chain");
+    (RSA_4096_END_FULLCHAIN, "rsa-4096", "end.fullchain");
+    (RSA_4096_END_KEY, "rsa-4096", "end.key");
+    (RSA_4096_INTER_CERT, "rsa-4096", "inter.cert");
+    (RSA_4096_INTER_KEY, "rsa-4096", "inter.key");
+}
+
+pub fn transfer(left_output: &mut Vec<u8>, right_input: &mut VecInput) -> usize {
+    let total = left_output.len();
+    let mut offs = 0;
+    while offs < total {
+        let from_buf: &mut dyn io::Read = &mut &left_output[offs..];
+        offs += right_input.read(from_buf).unwrap();
+    }
+
+    left_output.clear();
+    total
+}
+
+pub fn transfer_eof(input: &mut VecInput) {
+    let empty_buf = [0u8; 0];
+    let empty_cursor: &mut dyn io::Read = &mut &empty_buf[..];
+    let sz = input.read(empty_cursor).unwrap();
+    assert_eq!(sz, 0);
+}
+
+pub enum Altered {
+    /// message has been edited in-place (or is unchanged)
+    InPlace,
+    /// send these raw bytes instead of the message.
+    Raw(Vec<u8>),
+}
+
+pub fn transfer_altered<F>(
+    left_output: &mut Vec<u8>,
+    filter: F,
+    right_input: &mut VecInput,
+) -> usize
+where
+    F: Fn(&mut Record<Vec<u8>>) -> Altered,
+{
+    let sz = left_output.len();
+
+    let mut offset = 0;
+    while offset < sz {
+        assert!(
+            offset + 5 <= sz,
+            "incomplete TLS record header at offset {offset}"
+        );
+
+        let typ = ContentType::from(left_output[offset]);
+        let version = ProtocolVersion::from(u16::from_be_bytes([
+            left_output[offset + 1],
+            left_output[offset + 2],
+        ]));
+        let payload_len =
+            u16::from_be_bytes([left_output[offset + 3], left_output[offset + 4]]) as usize;
+
+        assert!(
+            offset + 5 + payload_len <= sz,
+            "incomplete TLS record payload at offset {offset}"
+        );
+
+        let payload = left_output[offset + 5..offset + 5 + payload_len].to_vec();
+        offset += 5 + payload_len;
+
+        let mut record = Record {
+            typ,
+            version: EncodableVersion::Legacy(version),
+            payload,
+        };
+
+        let record_enc = match filter(&mut record) {
+            Altered::InPlace => {
+                encoding::record_framing(record.typ, version, record.payload.clone())
+            }
+            Altered::Raw(data) => data,
+        };
+
+        let record_enc_reader: &mut dyn io::Read = &mut &record_enc[..];
+        let len = right_input
+            .read(record_enc_reader)
+            .unwrap();
+        assert_eq!(len, record_enc.len());
+    }
+
+    left_output.clear();
+    sz
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq)]
+pub enum KeyType {
+    Rsa2048,
+    Rsa3072,
+    Rsa4096,
+    #[default]
+    EcdsaP256,
+    EcdsaP384,
+    EcdsaP521,
+    Ed25519,
+}
+
+static ALL_KEY_TYPES: &[KeyType] = &[
+    KeyType::Rsa2048,
+    KeyType::Rsa3072,
+    KeyType::Rsa4096,
+    KeyType::EcdsaP256,
+    KeyType::EcdsaP384,
+    KeyType::EcdsaP521,
+    KeyType::Ed25519,
+];
+
+static ALL_KEY_TYPES_EXCEPT_P521: &[KeyType] = &[
+    KeyType::Rsa2048,
+    KeyType::Rsa3072,
+    KeyType::Rsa4096,
+    KeyType::EcdsaP256,
+    KeyType::EcdsaP384,
+    KeyType::Ed25519,
+];
+
+impl KeyType {
+    pub fn all_for_provider(provider: &CryptoProvider) -> &'static [Self] {
+        match provider
+            .key_provider
+            .load_private_key(Self::EcdsaP521.key())
+            .is_ok()
+        {
+            true => ALL_KEY_TYPES,
+            false => ALL_KEY_TYPES_EXCEPT_P521,
+        }
+    }
+
+    fn bytes_for(&self, part: &str) -> &'static [u8] {
+        match self {
+            Self::Rsa2048 => bytes_for("rsa-2048", part),
+            Self::Rsa3072 => bytes_for("rsa-3072", part),
+            Self::Rsa4096 => bytes_for("rsa-4096", part),
+            Self::EcdsaP256 => bytes_for("ecdsa-p256", part),
+            Self::EcdsaP384 => bytes_for("ecdsa-p384", part),
+            Self::EcdsaP521 => bytes_for("ecdsa-p521", part),
+            Self::Ed25519 => bytes_for("eddsa", part),
+        }
+    }
+
+    pub fn identity(&self) -> Arc<Identity<'static>> {
+        Arc::new(
+            Identity::from_cert_chain(
+                CertificateDer::pem_slice_iter(self.bytes_for("end.fullchain"))
+                    .map(|result| result.unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    pub fn spki(&self) -> SubjectPublicKeyInfoDer<'static> {
+        SubjectPublicKeyInfoDer::from_pem_slice(self.bytes_for("end.spki.pem")).unwrap()
+    }
+
+    pub fn load_key(&self, provider: &CryptoProvider) -> Box<dyn SigningKey> {
+        provider
+            .key_provider
+            .load_private_key(self.key())
+            .expect("valid key")
+    }
+
+    pub fn key(&self) -> PrivateKeyDer<'static> {
+        PrivatePkcs8KeyDer::from_pem_slice(self.bytes_for("end.key"))
+            .unwrap()
+            .into()
+    }
+
+    pub fn client_identity(&self) -> Arc<Identity<'static>> {
+        Arc::new(
+            Identity::from_cert_chain(
+                CertificateDer::pem_slice_iter(self.bytes_for("client.fullchain"))
+                    .map(|result| result.unwrap())
+                    .collect(),
+            )
+            .unwrap(),
+        )
+    }
+
+    pub fn end_entity_crl(&self) -> CertificateRevocationListDer<'static> {
+        self.crl("end", "revoked")
+    }
+
+    pub fn client_crl(&self) -> CertificateRevocationListDer<'static> {
+        self.crl("client", "revoked")
+    }
+
+    pub fn intermediate_crl(&self) -> CertificateRevocationListDer<'static> {
+        self.crl("inter", "revoked")
+    }
+
+    pub fn end_entity_crl_expired(&self) -> CertificateRevocationListDer<'static> {
+        self.crl("end", "expired")
+    }
+
+    pub fn client_key(&self) -> PrivateKeyDer<'static> {
+        PrivatePkcs8KeyDer::from_pem_slice(self.bytes_for("client.key"))
+            .unwrap()
+            .into()
+    }
+
+    pub fn client_spki(&self) -> SubjectPublicKeyInfoDer<'static> {
+        SubjectPublicKeyInfoDer::from_pem_slice(self.bytes_for("client.spki.pem")).unwrap()
+    }
+
+    pub fn certified_client_key(&self, provider: &CryptoProvider) -> Result<Credentials, Error> {
+        let private_key = provider
+            .key_provider
+            .load_private_key(self.client_key())?;
+        let public_key = private_key
+            .public_key()
+            .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))?
+            .into_owned();
+        Ok(Credentials::new_unchecked(
+            Arc::new(Identity::RawPublicKey(public_key)),
+            private_key,
+        ))
+    }
+
+    pub fn credentials_with_raw_pub_key(
+        &self,
+        provider: &CryptoProvider,
+    ) -> Result<Credentials, Error> {
+        let private_key = provider
+            .key_provider
+            .load_private_key(self.key())?;
+        let public_key = private_key
+            .public_key()
+            .ok_or(Error::InconsistentKeys(InconsistentKeys::Unknown))?
+            .into_owned();
+        Ok(Credentials::new_unchecked(
+            Arc::new(Identity::RawPublicKey(public_key)),
+            private_key,
+        ))
+    }
+
+    pub fn credentials_with_cert_chain(
+        &self,
+        provider: &CryptoProvider,
+    ) -> Result<Credentials, Error> {
+        let private_key = provider
+            .key_provider
+            .load_private_key(self.key())?;
+        Credentials::new(self.identity(), private_key)
+    }
+
+    fn crl(&self, role: &str, r#type: &str) -> CertificateRevocationListDer<'static> {
+        CertificateRevocationListDer::from_pem_slice(
+            self.bytes_for(&format!("{role}.{type}.crl.pem")),
+        )
+        .unwrap()
+    }
+
+    pub fn ca_distinguished_name(&self) -> DistinguishedName {
+        match self {
+            Self::Rsa2048 => &b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 2048 CA"[..],
+            Self::Rsa3072 => b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 3072 CA",
+            Self::Rsa4096 => b"0\x1f1\x1d0\x1b\x06\x03U\x04\x03\x0c\x14ponytown RSA 4096 CA",
+            Self::EcdsaP256 => b"0\x211\x1f0\x1d\x06\x03U\x04\x03\x0c\x16ponytown ECDSA p256 CA",
+            Self::EcdsaP384 => b"0\x211\x1f0\x1d\x06\x03U\x04\x03\x0c\x16ponytown ECDSA p384 CA",
+            Self::EcdsaP521 => b"0\x211\x1f0\x1d\x06\x03U\x04\x03\x0c\x16ponytown ECDSA p521 CA",
+            Self::Ed25519 => b"0\x1c1\x1a0\x18\x06\x03U\x04\x03\x0c\x11ponytown EdDSA CA",
+        }
+        .to_vec()
+        .into()
+    }
+
+    pub fn client_root_store(&self) -> Arc<RootCertStore> {
+        let mut roots = RootCertStore::empty();
+        roots.add(self.ca_cert()).unwrap();
+        roots.into()
+    }
+
+    pub fn ca_cert(&self) -> CertificateDer<'_> {
+        let Identity::X509(id) = &*self.identity() else {
+            panic!("expected raw key identity");
+        };
+
+        id.intermediates
+            .iter()
+            .next_back()
+            .cloned()
+            .expect("cert chain cannot be empty")
+    }
+}
+
+/// An iterator for testing several combinations of config
+///
+/// By default the iterator goes over compatible pairs of client/server configs
+/// alongside the expected `KeyType`:
+///
+/// - for the provider as-is
+/// - for the provider reduced to only support TLS1.2 and 1.3 alone
+/// - for each key type supported by the provider
+/// - for server authentication and mutual authentication
+pub struct MultiTest {
+    providers: Vec<(ProtocolVersion, Arc<CryptoProvider>)>,
+    anon_client: bool,
+    client_auth: ClientAuth,
+    #[expect(clippy::type_complexity)]
+    custom_server_verifier:
+        Option<Box<dyn Fn(KeyType, Arc<CryptoProvider>) -> Arc<dyn ServerVerifier>>>,
+    key_types: Vec<KeyType>,
+}
+
+impl MultiTest {
+    pub fn new(provider: CryptoProvider) -> Self {
+        let key_types = KeyType::all_for_provider(&provider).to_vec();
+        let mut providers = vec![];
+
+        if !provider.tls13_cipher_suites.is_empty() {
+            providers.push((ProtocolVersion::TLSv1_3, Arc::new(provider.clone())));
+            providers.push((
+                ProtocolVersion::TLSv1_3,
+                Arc::new(CryptoProvider {
+                    tls12_cipher_suites: Cow::Borrowed(&[]),
+                    ..provider.clone()
+                }),
+            ));
+        }
+
+        if !provider.tls12_cipher_suites.is_empty() {
+            providers.push((
+                ProtocolVersion::TLSv1_2,
+                Arc::new(CryptoProvider {
+                    tls13_cipher_suites: Cow::Borrowed(&[]),
+                    ..provider
+                }),
+            ));
+        }
+
+        Self {
+            providers,
+            anon_client: true,
+            client_auth: ClientAuth::Yes,
+            custom_server_verifier: None,
+            key_types,
+        }
+    }
+
+    pub fn require_client_auth(mut self) -> Self {
+        self.anon_client = false;
+        self
+    }
+
+    pub fn with_client_verifier(
+        mut self,
+        builder: Box<dyn Fn(KeyType, Arc<CryptoProvider>) -> Arc<dyn ClientVerifier>>,
+    ) -> Self {
+        self.client_auth = ClientAuth::CustomClientVerifier(builder);
+        self
+    }
+
+    pub fn with_server_verifier(
+        mut self,
+        builder: Box<dyn Fn(KeyType, Arc<CryptoProvider>) -> Arc<dyn ServerVerifier>>,
+    ) -> Self {
+        self.custom_server_verifier = Some(builder);
+        self
+    }
+}
+
+impl IntoIterator for MultiTest {
+    type Item = (Arc<ClientConfig>, Arc<ServerConfig>, Expectation);
+    type IntoIter = std::vec::IntoIter<Self::Item>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        let mut options = vec![];
+
+        for (version, provider) in self.providers {
+            for kt in &self.key_types {
+                let verifier = match &self.custom_server_verifier {
+                    Some(make_verifier) => make_verifier(*kt, provider.clone()),
+                    None => Arc::new(
+                        WebPkiServerVerifier::builder(kt.client_root_store(), &provider)
+                            .build()
+                            .unwrap(),
+                    ),
+                };
+
+                if self.anon_client {
+                    options.push((
+                        Arc::new(
+                            ClientConfig::builder(provider.clone())
+                                .dangerous()
+                                .with_custom_certificate_verifier(verifier.clone())
+                                .with_no_client_auth()
+                                .unwrap(),
+                        ),
+                        Arc::new(make_server_config(*kt, &provider)),
+                        Expectation {
+                            key_type: *kt,
+                            client_auth: false,
+                            version,
+                        },
+                    ));
+                }
+
+                let client_auth_config = Arc::new(
+                    ClientConfig::builder(provider.clone())
+                        .dangerous()
+                        .with_custom_certificate_verifier(verifier)
+                        .with_client_auth_cert(kt.client_identity(), kt.client_key())
+                        .unwrap(),
+                );
+
+                match &self.client_auth {
+                    ClientAuth::Yes => {
+                        options.push((
+                            client_auth_config,
+                            Arc::new(make_server_config_with_mandatory_client_auth(
+                                *kt, &provider,
+                            )),
+                            Expectation {
+                                key_type: *kt,
+                                client_auth: true,
+                                version,
+                            },
+                        ));
+                    }
+                    ClientAuth::CustomClientVerifier(make_verifier) => {
+                        options.push((
+                            client_auth_config,
+                            Arc::new(
+                                ServerConfig::builder(provider.clone())
+                                    .with_client_cert_verifier(make_verifier(*kt, provider.clone()))
+                                    .with_single_cert(kt.identity(), kt.key())
+                                    .unwrap(),
+                            ),
+                            Expectation {
+                                key_type: *kt,
+                                client_auth: true,
+                                version,
+                            },
+                        ));
+                    }
+                }
+            }
+        }
+
+        options.into_iter()
+    }
+}
+
+#[derive(Debug)]
+pub struct Expectation {
+    pub key_type: KeyType,
+    pub client_auth: bool,
+    pub version: ProtocolVersion,
+}
+
+pub enum ClientAuth {
+    Yes,
+    CustomClientVerifier(Box<dyn Fn(KeyType, Arc<CryptoProvider>) -> Arc<dyn ClientVerifier>>),
+}
+
+pub trait ServerConfigExt {
+    fn finish(self, kt: KeyType) -> ServerConfig;
+}
+
+impl ServerConfigExt for ConfigBuilder<ServerConfig, WantsVerifier> {
+    fn finish(self, kt: KeyType) -> ServerConfig {
+        self.with_no_client_auth()
+            .with_single_cert(kt.identity(), kt.key())
+            .unwrap()
+    }
+}
+
+pub fn make_server_config(kt: KeyType, provider: &CryptoProvider) -> ServerConfig {
+    ServerConfig::builder(provider.clone().into()).finish(kt)
+}
+
+pub fn make_server_config_with_kx_groups(
+    kt: KeyType,
+    kx_groups: Vec<&'static dyn SupportedKxGroup>,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    ServerConfig::builder(
+        CryptoProvider {
+            kx_groups: Cow::Owned(kx_groups),
+            ..provider.clone()
+        }
+        .into(),
+    )
+    .finish(kt)
+}
+
+pub fn make_server_config_with_mandatory_client_auth(
+    kt: KeyType,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    make_server_config_with_client_verifier(
+        kt,
+        webpki_client_verifier_builder(kt.client_root_store(), provider),
+        provider,
+    )
+}
+
+pub fn make_server_config_with_optional_client_auth(
+    kt: KeyType,
+    crls: Vec<CertificateRevocationListDer<'static>>,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    make_server_config_with_client_verifier(
+        kt,
+        webpki_client_verifier_builder(kt.client_root_store(), provider)
+            .with_crls(crls)
+            .allow_unknown_revocation_status()
+            .allow_unauthenticated(),
+        provider,
+    )
+}
+
+pub fn make_server_config_with_client_verifier(
+    kt: KeyType,
+    verifier_builder: ClientVerifierBuilder,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    ServerConfig::builder(provider.clone().into())
+        .with_client_cert_verifier(Arc::new(verifier_builder.build().unwrap()))
+        .with_single_cert(kt.identity(), kt.key())
+        .unwrap()
+}
+
+pub fn make_server_config_with_raw_key_support(
+    kt: KeyType,
+    provider: &CryptoProvider,
+) -> ServerConfig {
+    let mut client_verifier = MockClientVerifier::new(|| Ok(()), kt, provider);
+    let server_cert_resolver = Arc::new(SingleCredential::from(
+        kt.credentials_with_raw_pub_key(provider)
+            .unwrap(),
+    ));
+    client_verifier.expect_raw_public_keys = true;
+    // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
+    ServerConfig::builder(provider.clone().into())
+        .with_client_cert_verifier(Arc::new(client_verifier))
+        .with_server_credential_resolver(server_cert_resolver)
+        .unwrap()
+}
+
+pub fn make_client_config_with_raw_key_support(
+    kt: KeyType,
+    provider: &CryptoProvider,
+) -> ClientConfig {
+    let server_verifier = Arc::new(MockServerVerifier::expects_raw_public_keys(provider));
+    let client_cert_resolver = Arc::new(SingleCredential::from(
+        kt.certified_client_key(provider)
+            .unwrap(),
+    ));
+    // We don't support tls1.2 for Raw Public Keys, hence the version is hard-coded.
+    ClientConfig::builder(provider.clone().into())
+        .dangerous()
+        .with_custom_certificate_verifier(server_verifier)
+        .with_client_credential_resolver(client_cert_resolver)
+        .unwrap()
+}
+
+pub trait ClientConfigExt {
+    fn finish(self, kt: KeyType) -> ClientConfig;
+    fn finish_with_creds(self, kt: KeyType) -> ClientConfig;
+    fn add_root_certs(self, kt: KeyType) -> ConfigBuilder<ClientConfig, WantsClientCert>;
+}
+
+impl ClientConfigExt for ConfigBuilder<ClientConfig, WantsVerifier> {
+    fn finish(self, kt: KeyType) -> ClientConfig {
+        self.add_root_certs(kt)
+            .with_no_client_auth()
+            .unwrap()
+    }
+
+    fn finish_with_creds(self, kt: KeyType) -> ClientConfig {
+        self.add_root_certs(kt)
+            .with_client_auth_cert(kt.client_identity(), kt.client_key())
+            .unwrap()
+    }
+
+    fn add_root_certs(self, kt: KeyType) -> ConfigBuilder<ClientConfig, WantsClientCert> {
+        let mut root_store = RootCertStore::empty();
+        root_store.add_parsable_certificates(
+            CertificateDer::pem_slice_iter(kt.bytes_for("ca.cert")).map(|result| result.unwrap()),
+        );
+
+        self.with_root_certificates(root_store)
+    }
+}
+
+pub fn make_client_config(kt: KeyType, provider: &CryptoProvider) -> ClientConfig {
+    ClientConfig::builder(provider.clone().into()).finish(kt)
+}
+
+pub fn make_client_config_with_kx_groups(
+    kt: KeyType,
+    kx_groups: Vec<&'static dyn SupportedKxGroup>,
+    provider: &CryptoProvider,
+) -> ClientConfig {
+    ClientConfig::builder(
+        CryptoProvider {
+            kx_groups: Cow::Owned(kx_groups),
+            ..provider.clone()
+        }
+        .into(),
+    )
+    .finish(kt)
+}
+
+pub fn make_client_config_with_auth(kt: KeyType, provider: &CryptoProvider) -> ClientConfig {
+    ClientConfig::builder(provider.clone().into()).finish_with_creds(kt)
+}
+
+pub fn webpki_client_verifier_builder(
+    roots: Arc<RootCertStore>,
+    provider: &CryptoProvider,
+) -> ClientVerifierBuilder {
+    WebPkiClientVerifier::builder(roots, provider)
+}
+
+pub fn webpki_server_verifier_builder(
+    roots: Arc<RootCertStore>,
+    provider: &CryptoProvider,
+) -> ServerVerifierBuilder {
+    WebPkiServerVerifier::builder(roots, provider)
+}
+
+#[derive(Debug, Default)]
+pub struct HandshakeBuffers {
+    pub client_input: VecInput,
+    pub client_output: Vec<u8>,
+    pub server_input: VecInput,
+    pub server_output: Vec<u8>,
+}
+
+impl HandshakeBuffers {
+    pub fn handshake(
+        &mut self,
+        client: &mut Connection<ClientSide, Tcp>,
+        server: &mut Connection<ServerSide, Tcp>,
+    ) -> (usize, usize) {
+        self.handshake_until_error(client, server)
+            .expect("handshake failed unexpectedly")
+    }
+
+    pub fn handshake_until_error(
+        &mut self,
+        client: &mut Connection<ClientSide, Tcp>,
+        server: &mut Connection<ServerSide, Tcp>,
+    ) -> Result<(usize, usize), ErrorFromPeer> {
+        let (mut to_client, mut to_server) = (0, 0);
+        while server.is_handshaking() || client.is_handshaking() {
+            to_server += transfer(&mut self.client_output, &mut self.server_input);
+            server
+                .read_tls(&mut self.server_input, &mut self.server_output)
+                .handle_all(&mut Vec::new())
+                .map_err(ErrorFromPeer::Server)?;
+            to_client += transfer(&mut self.server_output, &mut self.client_input);
+            client
+                .read_tls(&mut self.client_input, &mut self.client_output)
+                .handle_all(&mut Vec::new())
+                .map_err(ErrorFromPeer::Client)?;
+        }
+
+        Ok((to_server, to_client))
+    }
+
+    pub fn handshake_until_both_error(
+        &mut self,
+        client: &mut Connection<ClientSide, Tcp>,
+        server: &mut Connection<ServerSide, Tcp>,
+    ) -> Result<(), Vec<ErrorFromPeer>> {
+        match self.handshake_until_error(client, server) {
+            Err(server_err @ ErrorFromPeer::Server(_)) => {
+                let mut errors = vec![server_err];
+                transfer(&mut self.server_output, &mut self.client_input);
+                let client_err = client
+                    .read_tls(&mut self.client_input, &mut self.client_output)
+                    .handle_all(&mut Vec::new())
+                    .map_err(ErrorFromPeer::Client)
+                    .expect_err("client didn't produce error after server error");
+                errors.push(client_err);
+                Err(errors)
+            }
+
+            Err(client_err @ ErrorFromPeer::Client(_)) => {
+                let mut errors = vec![client_err];
+                transfer(&mut self.client_output, &mut self.server_input);
+                let server_err = server
+                    .read_tls(&mut self.server_input, &mut self.server_output)
+                    .handle_all(&mut Vec::new())
+                    .map_err(ErrorFromPeer::Server)
+                    .expect_err("server didn't produce error after client error");
+                errors.push(server_err);
+                Err(errors)
+            }
+
+            Ok(_) => Ok(()),
+        }
+    }
+
+    /// Like [`HandshakeBuffers::handshake()`], but collects early data received by the server into `server_early_data`.
+    pub fn handshake_collecting_early_data(
+        &mut self,
+        client: &mut Connection<ClientSide, Tcp>,
+        server: &mut Connection<ServerSide, Tcp>,
+        server_early_data: &mut Vec<u8>,
+    ) {
+        while server.is_handshaking() || client.is_handshaking() {
+            transfer(&mut self.client_output, &mut self.server_input);
+            let mut handler = server.read_tls(&mut self.server_input, &mut self.server_output);
+            while let Some(result) = handler.next_early_data() {
+                server_early_data.extend_from_slice(result.unwrap().bytes());
+            }
+            handler
+                .handle_all(&mut Vec::new())
+                .unwrap();
+            transfer(&mut self.server_output, &mut self.client_input);
+            client
+                .read_tls(&mut self.client_input, &mut self.client_output)
+                .handle_all(&mut Vec::new())
+                .unwrap();
+        }
+    }
+}
+
+pub fn make_pair(
+    kt: KeyType,
+    provider: &CryptoProvider,
+) -> (
+    Connection<ClientSide, Tcp>,
+    Connection<ServerSide, Tcp>,
+    HandshakeBuffers,
+) {
+    make_pair_for_configs(
+        make_client_config(kt, provider),
+        make_server_config(kt, provider),
+    )
+}
+
+pub fn make_pair_for_configs(
+    client_config: ClientConfig,
+    server_config: ServerConfig,
+) -> (
+    Connection<ClientSide, Tcp>,
+    Connection<ServerSide, Tcp>,
+    HandshakeBuffers,
+) {
+    make_pair_for_arc_configs(&Arc::new(client_config), &Arc::new(server_config))
+}
+
+pub fn make_pair_for_arc_configs(
+    client_config: &Arc<ClientConfig>,
+    server_config: &Arc<ServerConfig>,
+) -> (
+    Connection<ClientSide, Tcp>,
+    Connection<ServerSide, Tcp>,
+    HandshakeBuffers,
+) {
+    let mut buf = HandshakeBuffers::default();
+    let client = client_config
+        .connect(server_name("localhost"))
+        .build(&mut buf.client_output)
+        .unwrap();
+    (client, Connection::new(server_config.clone()).unwrap(), buf)
+}
+
+/// Return a client and server config that don't share a common cipher suite
+pub fn make_disjoint_suite_configs(provider: CryptoProvider) -> (ClientConfig, ServerConfig) {
+    let kt = KeyType::Rsa2048;
+    let client_provider = CryptoProvider {
+        tls13_cipher_suites: provider
+            .tls13_cipher_suites
+            .iter()
+            .copied()
+            .filter(|cs| cs.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
+            .collect(),
+        ..provider.clone()
+    };
+    let server_config = ServerConfig::builder(client_provider.into()).finish(kt);
+
+    let server_provider = CryptoProvider {
+        tls13_cipher_suites: provider
+            .tls13_cipher_suites
+            .iter()
+            .copied()
+            .filter(|cs| cs.common.suite == CipherSuite::TLS13_AES_256_GCM_SHA384)
+            .collect(),
+        ..provider
+    };
+    let client_config = ClientConfig::builder(server_provider.into()).finish(kt);
+
+    (client_config, server_config)
+}
+
+#[derive(PartialEq, Debug)]
+pub enum ErrorFromPeer {
+    Client(Error),
+    Server(Error),
+}
+
+pub fn server_name(name: &'static str) -> ServerName<'static> {
+    name.try_into().unwrap()
+}
+
+/// An object that impls `io::Read` and `io::Write` for testing.
+///
+/// The `reads` and `writes` fields set the behaviour of these trait
+/// implementations.  They return the `WouldBlock` error if not otherwise
+/// configured -- `TestNonBlockIo::default()` does this permanently.
+///
+/// This object panics on drop if the configured expected reads/writes
+/// didn't take place.
+#[derive(Debug, Default)]
+pub struct TestNonBlockIo {
+    /// Each `write()` call is satisfied by inspecting this field.
+    ///
+    /// If it is empty, `WouldBlock` is returned.  Otherwise the write is
+    /// satisfied by popping a value and returning it (reduced by the size
+    /// of the write buffer, if needed).
+    pub writes: Vec<usize>,
+
+    /// Each `read()` call is satisfied by inspecting this field.
+    ///
+    /// If it is empty, `WouldBlock` is returned.  Otherwise the read is
+    /// satisfied by popping a value and copying it into the output
+    /// buffer.  Each value must be no longer than the buffer for that
+    /// call.
+    pub reads: Vec<Vec<u8>>,
+}
+
+impl io::Read for TestNonBlockIo {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        match self.reads.pop() {
+            None => Err(io::ErrorKind::WouldBlock.into()),
+            Some(data) => {
+                assert!(data.len() <= buf.len());
+                let take = core::cmp::min(data.len(), buf.len());
+                buf[..take].clone_from_slice(&data[..take]);
+                Ok(take)
+            }
+        }
+    }
+}
+
+impl io::Write for TestNonBlockIo {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        match self.writes.pop() {
+            None => Err(io::ErrorKind::WouldBlock.into()),
+            Some(n) => Ok(core::cmp::min(n, buf.len())),
+        }
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+impl Drop for TestNonBlockIo {
+    fn drop(&mut self) {
+        // avoid aborting on a double panic, which would hide the original failure
+        if std::thread::panicking() {
+            return;
+        }
+
+        // ensure the object was exhausted as expected
+        assert!(self.reads.is_empty());
+        assert!(self.writes.is_empty());
+    }
+}
+
+pub fn do_suite_and_kx_test(
+    client_config: ClientConfig,
+    server_config: ServerConfig,
+    expect_suite: SupportedCipherSuite,
+    expect_kx: NamedGroup,
+    expect_version: ProtocolVersion,
+) {
+    println!(
+        "do_suite_test {:?} {:?}",
+        expect_version,
+        expect_suite.suite()
+    );
+    let mut server_output = Vec::new();
+    let (mut client, mut server, mut buf) = make_pair_for_configs(client_config, server_config);
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+
+    assert_eq!(None, client.negotiated_cipher_suite());
+    assert_eq!(None, server.negotiated_cipher_suite());
+    assert!(
+        client
+            .negotiated_key_exchange_group()
+            .is_none()
+    );
+    assert!(
+        server
+            .negotiated_key_exchange_group()
+            .is_none()
+    );
+    assert_eq!(None, client.protocol_version());
+    assert_eq!(None, server.protocol_version());
+    assert!(client.is_handshaking());
+    assert!(server.is_handshaking());
+
+    transfer(&mut buf.client_output, &mut server_input);
+    server
+        .read_tls(&mut server_input, &mut server_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    assert!(client.is_handshaking());
+    assert!(server.is_handshaking());
+    assert_eq!(None, client.protocol_version());
+    assert_eq!(Some(expect_version), server.protocol_version());
+    assert_eq!(None, client.negotiated_cipher_suite());
+    assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
+    assert!(
+        client
+            .negotiated_key_exchange_group()
+            .is_none()
+    );
+    if matches!(expect_version, ProtocolVersion::TLSv1_2) {
+        assert!(
+            server
+                .negotiated_key_exchange_group()
+                .is_none()
+        );
+    } else {
+        assert_eq!(
+            expect_kx,
+            server
+                .negotiated_key_exchange_group()
+                .unwrap()
+                .name()
+        );
+    }
+
+    transfer(&mut server_output, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    assert_eq!(Some(expect_suite), client.negotiated_cipher_suite());
+    assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
+    assert_eq!(
+        expect_kx,
+        client
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name()
+    );
+    if matches!(expect_version, ProtocolVersion::TLSv1_2) {
+        assert!(
+            server
+                .negotiated_key_exchange_group()
+                .is_none()
+        );
+    } else {
+        assert_eq!(
+            expect_kx,
+            server
+                .negotiated_key_exchange_group()
+                .unwrap()
+                .name()
+        );
+    }
+
+    transfer(&mut buf.client_output, &mut server_input);
+    server
+        .read_tls(&mut server_input, &mut server_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    transfer(&mut server_output, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    assert!(!client.is_handshaking());
+    assert!(!server.is_handshaking());
+    assert_eq!(Some(expect_version), client.protocol_version());
+    assert_eq!(Some(expect_version), server.protocol_version());
+    assert_eq!(Some(expect_suite), client.negotiated_cipher_suite());
+    assert_eq!(Some(expect_suite), server.negotiated_cipher_suite());
+    assert_eq!(
+        expect_kx,
+        client
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name()
+    );
+    assert_eq!(
+        expect_kx,
+        server
+            .negotiated_key_exchange_group()
+            .unwrap()
+            .name()
+    );
+}
+
+#[derive(Debug)]
+pub struct MockServerVerifier {
+    cert_rejection_error: Option<Error>,
+    tls12_signature_error: Option<Error>,
+    tls13_signature_error: Option<Error>,
+    signature_schemes: Vec<SignatureScheme>,
+    expected_ocsp_response: Option<Vec<u8>>,
+    requests_ocsp_response: bool,
+    requires_raw_public_keys: bool,
+    raw_public_key_algorithms: Option<WebPkiSupportedAlgorithms>,
+}
+
+impl ServerVerifier for MockServerVerifier {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        println!("verify_identity({identity:?})");
+        if let Some(expected_ocsp) = &self.expected_ocsp_response {
+            assert_eq!(expected_ocsp, identity.ocsp_response);
+        }
+        match &self.cert_rejection_error {
+            Some(error) => Err(error.clone()),
+            _ => Ok(VerifiedIdentity::assertion(identity.identity.clone())),
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        println!("verify_tls12_signature({input:?})");
+        match &self.tls12_signature_error {
+            Some(error) => Err(error.clone()),
+            _ => Ok(HandshakeSignatureValid::assertion()),
+        }
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        println!("verify_tls13_signature({input:?})");
+        match &self.tls13_signature_error {
+            Some(error) => Err(error.clone()),
+            _ if self.requires_raw_public_keys => verify_tls13_signature(
+                input,
+                self.raw_public_key_algorithms
+                    .as_ref()
+                    .unwrap(),
+            ),
+            _ => Ok(HandshakeSignatureValid::assertion()),
+        }
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        self.signature_schemes.clone()
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        self.requests_ocsp_response || self.expected_ocsp_response.is_some()
+    }
+
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        match self.requires_raw_public_keys {
+            false => &[CertificateType::X509],
+            true => &[CertificateType::RawPublicKey],
+        }
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
+}
+
+impl MockServerVerifier {
+    pub fn accepts_anything() -> Self {
+        Self {
+            cert_rejection_error: None,
+            ..Default::default()
+        }
+    }
+
+    pub fn expects_ocsp_response(response: &[u8]) -> Self {
+        Self {
+            expected_ocsp_response: Some(response.to_vec()),
+            ..Default::default()
+        }
+    }
+
+    pub fn rejects_certificate(err: Error) -> Self {
+        Self {
+            cert_rejection_error: Some(err),
+            ..Default::default()
+        }
+    }
+
+    /// Request a stapled OCSP response, without checking its contents.
+    pub fn requesting_ocsp_response(self) -> Self {
+        Self {
+            requests_ocsp_response: true,
+            ..self
+        }
+    }
+
+    pub fn rejects_tls12_signatures(err: Error) -> Self {
+        Self {
+            tls12_signature_error: Some(err),
+            ..Default::default()
+        }
+    }
+
+    pub fn rejects_tls13_signatures(err: Error) -> Self {
+        Self {
+            tls13_signature_error: Some(err),
+            ..Default::default()
+        }
+    }
+
+    pub fn offers_no_signature_schemes() -> Self {
+        Self {
+            signature_schemes: vec![],
+            ..Default::default()
+        }
+    }
+
+    pub fn expects_raw_public_keys(provider: &CryptoProvider) -> Self {
+        Self {
+            requires_raw_public_keys: true,
+            raw_public_key_algorithms: Some(provider.signature_verification_algorithms),
+            ..Default::default()
+        }
+    }
+}
+
+impl Default for MockServerVerifier {
+    fn default() -> Self {
+        Self {
+            cert_rejection_error: None,
+            tls12_signature_error: None,
+            tls13_signature_error: None,
+            signature_schemes: vec![
+                SignatureScheme::RSA_PSS_SHA256,
+                SignatureScheme::RSA_PKCS1_SHA256,
+                SignatureScheme::ED25519,
+                SignatureScheme::ECDSA_NISTP256_SHA256,
+                SignatureScheme::ECDSA_NISTP384_SHA384,
+                SignatureScheme::ECDSA_NISTP521_SHA512,
+            ],
+            expected_ocsp_response: None,
+            requests_ocsp_response: false,
+            requires_raw_public_keys: false,
+            raw_public_key_algorithms: None,
+        }
+    }
+}
+
+#[derive(Debug)]
+pub struct MockClientVerifier {
+    pub verified: fn() -> Result<(), Error>,
+    pub subjects: Arc<[DistinguishedName]>,
+    pub mandatory: bool,
+    pub offered_schemes: Option<Vec<SignatureScheme>>,
+    expect_raw_public_keys: bool,
+    raw_public_key_algorithms: Option<WebPkiSupportedAlgorithms>,
+    parent: Arc<dyn ClientVerifier>,
+}
+
+impl MockClientVerifier {
+    pub fn new(
+        verified: fn() -> Result<(), Error>,
+        kt: KeyType,
+        provider: &CryptoProvider,
+    ) -> Self {
+        Self {
+            parent: Arc::new(
+                webpki_client_verifier_builder(kt.client_root_store(), provider)
+                    .build()
+                    .unwrap(),
+            ),
+            verified,
+            subjects: Arc::from(kt.client_root_store().subjects()),
+            mandatory: true,
+            offered_schemes: None,
+            expect_raw_public_keys: false,
+            raw_public_key_algorithms: Some(provider.signature_verification_algorithms),
+        }
+    }
+}
+
+impl ClientVerifier for MockClientVerifier {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ClientIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        (self.verified)()?;
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        if self.expect_raw_public_keys {
+            Ok(HandshakeSignatureValid::assertion())
+        } else {
+            self.parent
+                .verify_tls12_signature(input)
+        }
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        if self.expect_raw_public_keys {
+            verify_tls13_signature(
+                input,
+                self.raw_public_key_algorithms
+                    .as_ref()
+                    .unwrap(),
+            )
+        } else {
+            self.parent
+                .verify_tls13_signature(input)
+        }
+    }
+
+    fn root_hint_subjects(&self) -> Arc<[DistinguishedName]> {
+        self.subjects.clone()
+    }
+
+    fn client_auth_mandatory(&self) -> bool {
+        self.mandatory
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        if let Some(schemes) = &self.offered_schemes {
+            schemes.clone()
+        } else {
+            self.parent.supported_verify_schemes()
+        }
+    }
+
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        match self.expect_raw_public_keys {
+            false => &[CertificateType::X509],
+            true => &[CertificateType::RawPublicKey],
+        }
+    }
+}
+
+/// This allows injection/receipt of raw messages into a post-handshake connection.
+///
+/// It consumes one of the peers, extracts its secrets, and then reconstitutes the
+/// message encrypter/decrypter.  It does not do fragmentation/joining.
+pub struct RawTls {
+    encrypter: Box<dyn RecordEncrypter>,
+    enc_seq: u64,
+    decrypter: Box<dyn RecordDecrypter>,
+    dec_seq: u64,
+}
+
+impl RawTls {
+    /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
+    pub fn new_client(conn: Connection<ClientSide, Tcp>) -> Self {
+        let suite = conn.negotiated_cipher_suite().unwrap();
+        Self::new(
+            suite,
+            conn.dangerous_extract_secrets()
+                .unwrap(),
+        )
+    }
+
+    /// conn must be post-handshake, and must have been created with `enable_secret_extraction`
+    pub fn new_server(conn: Connection<ServerSide, Tcp>) -> Self {
+        let suite = conn.negotiated_cipher_suite().unwrap();
+        Self::new(
+            suite,
+            conn.dangerous_extract_secrets()
+                .unwrap(),
+        )
+    }
+
+    fn new(suite: SupportedCipherSuite, secrets: rustls::ExtractedSecrets) -> Self {
+        let rustls::ExtractedSecrets {
+            tx: (tx_seq, tx_keys),
+            rx: (rx_seq, rx_keys),
+        } = secrets;
+
+        let encrypter = match (tx_keys, suite) {
+            (
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
+                SupportedCipherSuite::Tls13(tls13),
+            ) => tls13.aead_alg.encrypter(key, iv),
+
+            (
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
+                SupportedCipherSuite::Tls12(tls12),
+            ) => tls12
+                .aead_alg
+                .encrypter(key, &iv.as_ref()[..4], &iv.as_ref()[4..]),
+
+            _ => todo!(),
+        };
+
+        let decrypter = match (rx_keys, suite) {
+            (
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
+                SupportedCipherSuite::Tls13(tls13),
+            ) => tls13.aead_alg.decrypter(key, iv),
+
+            (
+                ConnectionTrafficSecrets::Aes128Gcm { key, iv }
+                | ConnectionTrafficSecrets::Aes256Gcm { key, iv }
+                | ConnectionTrafficSecrets::Chacha20Poly1305 { key, iv },
+                SupportedCipherSuite::Tls12(tls12),
+            ) => tls12
+                .aead_alg
+                .decrypter(key, &iv.as_ref()[..4]),
+
+            _ => todo!(),
+        };
+
+        Self {
+            encrypter,
+            enc_seq: tx_seq,
+            decrypter,
+            dec_seq: rx_seq,
+        }
+    }
+
+    pub fn encrypt_and_send(&mut self, msg: &Record<Payload<'_>>, peer_input: &mut VecInput) {
+        let record = self.encrypt(msg);
+        peer_input
+            .read(&mut io::Cursor::new(record))
+            .unwrap();
+    }
+
+    /// Encrypt `msg` into a complete TLS record, including its header
+    pub fn encrypt(&mut self, msg: &Record<Payload<'_>>) -> Vec<u8> {
+        let msg = msg.borrow_outbound();
+        let mut record = vec![];
+        self.encrypter
+            .encrypt(msg, self.enc_seq, &mut record)
+            .unwrap();
+
+        self.enc_seq += 1;
+        record
+    }
+
+    pub fn receive_and_decrypt(&mut self, peer_output: &mut Vec<u8>, f: impl Fn(Record<&[u8]>)) {
+        let mut data = mem::take(peer_output);
+
+        // Parse TLS record header: 1 byte type, 2 bytes version, 2 bytes length
+        assert!(data.len() >= 5, "incomplete TLS record header");
+        let typ = ContentType::from(data[0]);
+        let version = ProtocolVersion::from(u16::from_be_bytes([data[1], data[2]]));
+        let len = u16::from_be_bytes([data[3], data[4]]) as usize;
+        let left = &mut data[5..];
+        assert_eq!(len, left.len());
+
+        let inbound = Record {
+            typ,
+            version: EncodableVersion::Legacy(version),
+            payload: InboundOpaque(left),
+        };
+
+        let record = self
+            .decrypter
+            .decrypt(inbound, self.dec_seq)
+            .unwrap();
+        self.dec_seq += 1;
+
+        println!("receive_and_decrypt: {record:?}");
+
+        f(record);
+    }
+}
+
+pub fn aes_128_gcm_with_1024_confidentiality_limit(
+    provider: CryptoProvider,
+) -> Arc<CryptoProvider> {
+    const CONFIDENTIALITY_LIMIT: u64 = 1024;
+
+    // needed to extend lifetime of Tls13CipherSuite to 'static
+    static TLS13_LIMITED_SUITE: OnceLock<rustls::Tls13CipherSuite> = OnceLock::new();
+    static TLS12_LIMITED_SUITE: OnceLock<rustls::Tls12CipherSuite> = OnceLock::new();
+
+    let tls13_limited = TLS13_LIMITED_SUITE.get_or_init(|| {
+        let tls13 = provider
+            .tls13_cipher_suites
+            .iter()
+            .find(|cs| cs.common.suite == CipherSuite::TLS13_AES_128_GCM_SHA256)
+            .unwrap();
+
+        rustls::Tls13CipherSuite {
+            common: rustls::crypto::CipherSuiteCommon {
+                confidentiality_limit: CONFIDENTIALITY_LIMIT,
+                ..tls13.common
+            },
+            ..**tls13
+        }
+    });
+
+    let tls12_limited = TLS12_LIMITED_SUITE.get_or_init(|| {
+        let tls12 = provider
+            .tls12_cipher_suites
+            .iter()
+            .find(|cs| cs.common.suite == CipherSuite::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256)
+            .unwrap();
+
+        rustls::Tls12CipherSuite {
+            common: rustls::crypto::CipherSuiteCommon {
+                confidentiality_limit: CONFIDENTIALITY_LIMIT,
+                ..tls12.common
+            },
+            ..**tls12
+        }
+    });
+
+    CryptoProvider {
+        tls12_cipher_suites: Cow::Owned(vec![tls12_limited]),
+        tls13_cipher_suites: Cow::Owned(vec![tls13_limited]),
+        ..provider
+    }
+    .into()
+}
+
+pub fn unsafe_plaintext_crypto_provider(provider: CryptoProvider) -> Arc<CryptoProvider> {
+    static TLS13_PLAIN_SUITE: OnceLock<rustls::Tls13CipherSuite> = OnceLock::new();
+
+    let tls13 = TLS13_PLAIN_SUITE.get_or_init(|| {
+        let tls13 = provider
+            .tls13_cipher_suites
+            .iter()
+            .find(|cs| cs.common.suite == CipherSuite::TLS13_AES_256_GCM_SHA384)
+            .unwrap();
+
+        rustls::Tls13CipherSuite {
+            aead_alg: &plaintext::Aead,
+            common: rustls::crypto::CipherSuiteCommon { ..tls13.common },
+            ..**tls13
+        }
+    });
+
+    CryptoProvider {
+        tls13_cipher_suites: Cow::Owned(vec![tls13]),
+        ..provider
+    }
+    .into()
+}
+
+#[derive(Default, Debug)]
+pub struct ServerCheckCertResolve {
+    pub expected_sni: Option<DnsName<'static>>,
+    pub expected_sigalgs: Option<Vec<SignatureScheme>>,
+    pub expected_alpn: Option<Vec<Vec<u8>>>,
+    pub expected_cipher_suites: Option<Vec<CipherSuite>>,
+    pub expected_server_cert_types: Option<Vec<CertificateType>>,
+    pub expected_client_cert_types: Option<Vec<CertificateType>>,
+    pub expected_named_groups: Option<Vec<NamedGroup>>,
+}
+
+impl ServerCredentialResolver for ServerCheckCertResolve {
+    fn resolve(&self, client_hello: &ClientHello<'_>) -> Result<SelectedCredential, Error> {
+        if client_hello
+            .signature_schemes()
+            .is_empty()
+        {
+            panic!("no signature schemes shared by client");
+        }
+
+        if client_hello.cipher_suites().is_empty() {
+            panic!("no cipher suites shared by client");
+        }
+
+        if let Some(expected_sni) = &self.expected_sni {
+            let sni = client_hello
+                .server_name()
+                .expect("sni unexpectedly absent");
+            assert_eq!(expected_sni, sni);
+        }
+
+        if let Some(expected_sigalgs) = &self.expected_sigalgs {
+            assert_eq!(
+                expected_sigalgs,
+                client_hello.signature_schemes(),
+                "unexpected signature schemes"
+            );
+        }
+
+        if let Some(expected_alpn) = &self.expected_alpn {
+            let alpn = client_hello
+                .alpn()
+                .expect("alpn unexpectedly absent")
+                .collect::<Vec<_>>();
+            assert_eq!(alpn.len(), expected_alpn.len());
+
+            for (got, wanted) in alpn.iter().zip(expected_alpn.iter()) {
+                assert_eq!(got, &wanted.as_slice());
+            }
+        }
+
+        if let Some(expected_cipher_suites) = &self.expected_cipher_suites {
+            assert_eq!(
+                expected_cipher_suites,
+                client_hello.cipher_suites(),
+                "unexpected cipher suites"
+            );
+        }
+
+        if let Some(expected_server_cert) = &self.expected_server_cert_types {
+            assert_eq!(
+                expected_server_cert,
+                client_hello
+                    .server_cert_types()
+                    .expect("Server cert types not present"),
+                "unexpected server cert"
+            );
+        }
+
+        if let Some(expected_client_cert) = &self.expected_client_cert_types {
+            assert_eq!(
+                expected_client_cert,
+                client_hello
+                    .client_cert_types()
+                    .expect("Client cert types not present"),
+                "unexpected client cert"
+            );
+        }
+
+        if let Some(expected_named_groups) = &self.expected_named_groups {
+            assert_eq!(
+                expected_named_groups,
+                client_hello
+                    .named_groups()
+                    .expect("Named groups not present"),
+            )
+        }
+
+        Err(Error::NoSuitableCertificate)
+    }
+}
+
+pub struct OtherSession<'a, S: SideData> {
+    sess: &'a mut Connection<S, Tcp>,
+    input: &'a mut VecInput,
+    output: &'a mut Vec<u8>,
+    pub reads: usize,
+    /// Writevs(Chunks(Bytes))
+    pub writevs: Vec<Vec<Vec<u8>>>,
+    fail_ok: bool,
+    pub short_writes: bool,
+    pub last_error: Option<Error>,
+    pub buffered: bool,
+    buffer: Vec<Vec<u8>>,
+    pub received: Vec<u8>,
+}
+
+impl<'a, S: SideData> OtherSession<'a, S> {
+    pub fn new(
+        input: &'a mut VecInput,
+        output: &'a mut Vec<u8>,
+        sess: &'a mut Connection<S, Tcp>,
+    ) -> Self {
+        OtherSession {
+            sess,
+            input,
+            output,
+            reads: 0,
+            writevs: vec![],
+            fail_ok: false,
+            short_writes: false,
+            last_error: None,
+            buffered: false,
+            buffer: vec![],
+            received: vec![],
+        }
+    }
+
+    pub fn new_buffered(
+        input: &'a mut VecInput,
+        output: &'a mut Vec<u8>,
+        sess: &'a mut Connection<S, Tcp>,
+    ) -> Self {
+        let mut os = OtherSession::new(input, output, sess);
+        os.buffered = true;
+        os
+    }
+
+    pub fn new_fails(
+        input: &'a mut VecInput,
+        output: &'a mut Vec<u8>,
+        sess: &'a mut Connection<S, Tcp>,
+    ) -> Self {
+        let mut os = OtherSession::new(input, output, sess);
+        os.fail_ok = true;
+        os
+    }
+
+    fn flush_vectored(&mut self, b: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        let mut total = 0;
+        let mut chunks = vec![];
+        for bytes in b {
+            let write_len = if self.short_writes {
+                if bytes.len() > 5 {
+                    bytes.len() / 2
+                } else {
+                    bytes.len()
+                }
+            } else {
+                bytes.len()
+            };
+
+            let l = self
+                .input
+                .read(&mut io::Cursor::new(&bytes[..write_len]))?;
+            chunks.push(bytes[..write_len].to_vec());
+            total += l;
+            if bytes.len() != l {
+                break;
+            }
+        }
+
+        let iter = self
+            .sess
+            .read_tls(self.input, self.output);
+        match (iter.handle_all(&mut self.received), self.fail_ok) {
+            (Ok(_), false) => (),
+            (Err(error), true) => self.last_error = Some(error),
+            (Ok(_), true) => panic!("read_all() succeeded unexpectedly"),
+            (Err(error), false) => panic!("read_all() failed unexpectedly: {error}"),
+        }
+
+        self.writevs.push(chunks);
+        Ok(total)
+    }
+
+    pub fn writev_lengths(&self) -> Vec<Vec<usize>> {
+        self.writevs
+            .iter()
+            .map(|write| {
+                write
+                    .iter()
+                    .map(|chunk| chunk.len())
+                    .collect()
+            })
+            .collect()
+    }
+
+    pub fn record_lengths(&self) -> Vec<usize> {
+        let mut buffer = vec![];
+        for writev in &self.writevs {
+            for chunk in writev {
+                buffer.append(&mut chunk.clone());
+            }
+        }
+
+        let mut lengths = vec![];
+        let mut offset = 0;
+        while offset < buffer.len() {
+            let header = &buffer[offset..offset + 5];
+            println!(
+                "message header: ty={:x?} ver={:x?} len={:x?}",
+                header[0],
+                &header[1..3],
+                &header[3..5]
+            );
+            let len = u16::from_be_bytes(header[3..5].try_into().unwrap()) as usize;
+            lengths.push(header.len() + len);
+            offset += header.len() + len;
+        }
+
+        lengths
+    }
+}
+
+impl<S: SideData> io::Read for OtherSession<'_, S> {
+    fn read(&mut self, b: &mut [u8]) -> io::Result<usize> {
+        self.reads += 1;
+        let n = Ord::min(b.len(), self.output.len());
+        b[..n].copy_from_slice(&self.output[..n]);
+        self.output.drain(..n);
+        Ok(n)
+    }
+}
+
+impl<S: SideData> io::Write for OtherSession<'_, S> {
+    fn write(&mut self, b: &[u8]) -> io::Result<usize> {
+        self.write_vectored(&[io::IoSlice::new(b)])
+    }
+
+    fn flush(&mut self) -> io::Result<()> {
+        if !self.buffer.is_empty() {
+            let buffer = mem::take(&mut self.buffer);
+            let slices = buffer
+                .iter()
+                .map(|b| io::IoSlice::new(b))
+                .collect::<Vec<_>>();
+            self.flush_vectored(&slices)?;
+        }
+        Ok(())
+    }
+
+    fn write_vectored(&mut self, b: &[io::IoSlice<'_>]) -> io::Result<usize> {
+        if self.buffered {
+            self.buffer
+                .extend(b.iter().map(|s| s.to_vec()));
+            return Ok(b.iter().map(|s| s.len()).sum());
+        }
+        self.flush_vectored(b)
+    }
+}
+
+/// Check `iter` yields exactly `expected`
+#[track_caller]
+pub fn check_iter(iter: MessageHandler<'_, '_, impl SideData>, expected: &[u8]) {
+    let mut read = Vec::with_capacity(expected.len());
+    iter.handle_all(&mut read).unwrap();
+    assert_eq!(expected, &read);
+}
+
+/// Check `reader` has available exactly `bytes`
+#[track_caller]
+pub fn check_read(reader: &mut dyn io::Read, bytes: &[u8]) {
+    let mut buf = vec![0u8; bytes.len() + 1];
+    assert_eq!(bytes.len(), reader.read(&mut buf).unwrap());
+    assert_eq!(bytes, &buf[..bytes.len()]);
+}
+
+/// Check `reader` yields only an error of kind `err_kind`
+#[track_caller]
+pub fn check_read_err(reader: &mut dyn io::Read, err_kind: io::ErrorKind) {
+    let mut buf = vec![0u8; 1];
+    let err = reader.read(&mut buf).unwrap_err();
+    assert!(matches!(err, err  if err.kind()  == err_kind))
+}
+
+/// Check `reader` has available exactly `bytes`
+#[track_caller]
+pub fn check_fill_buf(reader: &mut dyn io::BufRead, bytes: &[u8]) {
+    let b = reader.fill_buf().unwrap();
+    assert_eq!(b, bytes);
+    let len = b.len();
+    reader.consume(len);
+}
+
+/// Check `reader` yields only an error of kind `err_kind`
+#[track_caller]
+pub fn check_fill_buf_err(reader: &mut dyn io::BufRead, err_kind: io::ErrorKind) {
+    let err = reader.fill_buf().unwrap_err();
+    assert!(matches!(err, err if err.kind() == err_kind))
+}
+
+pub fn certificate_error_expecting_name(expected: &str) -> CertificateError {
+    CertificateError::NotValidForNameContext {
+        expected: ServerName::try_from(expected)
+            .unwrap()
+            .to_owned(),
+        presented: vec![
+            // ref. examples/internal/test_ca.rs
+            r#"DnsName("testserver.com")"#.into(),
+            r#"DnsName("second.testserver.com")"#.into(),
+            r#"DnsName("localhost")"#.into(),
+            "IpAddress(198.51.100.1)".into(),
+            "IpAddress(2001:db8::1)".into(),
+        ],
+    }
+}
+
+mod plaintext {
+    use rustls::ConnectionTrafficSecrets;
+    use rustls::crypto::cipher::{
+        AeadKey, InboundOpaque, Iv, OutboundPlain, RecordDecrypter, RecordEncrypter,
+        Tls13AeadAlgorithm, UnsupportedOperationError, encode_record_header,
+    };
+
+    use super::*;
+
+    pub(super) struct Aead;
+
+    impl Tls13AeadAlgorithm for Aead {
+        fn encrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn RecordEncrypter> {
+            Box::new(Encrypter)
+        }
+
+        fn decrypter(&self, _key: AeadKey, _iv: Iv) -> Box<dyn RecordDecrypter> {
+            Box::new(Decrypter)
+        }
+
+        fn key_len(&self) -> usize {
+            32
+        }
+
+        fn extract_keys(
+            &self,
+            _key: AeadKey,
+            _iv: Iv,
+        ) -> Result<ConnectionTrafficSecrets, UnsupportedOperationError> {
+            Err(UnsupportedOperationError)
+        }
+    }
+
+    struct Encrypter;
+
+    impl RecordEncrypter for Encrypter {
+        fn encrypt(
+            &mut self,
+            record: Record<OutboundPlain<'_>>,
+            _seq: u64,
+            out: &mut Vec<u8>,
+        ) -> Result<(), Error> {
+            out.extend_from_slice(&encode_record_header(
+                ContentType::ApplicationData,
+                record.version,
+                record.payload.len() as u16,
+            ));
+            for ch in record.payload.chunks() {
+                out.extend_from_slice(ch);
+            }
+
+            Ok(())
+        }
+
+        fn encrypted_payload_len(&self, payload_len: usize) -> usize {
+            payload_len
+        }
+    }
+
+    struct Decrypter;
+
+    impl RecordDecrypter for Decrypter {
+        fn decrypt<'a>(
+            &mut self,
+            record: Record<InboundOpaque<'a>>,
+            _seq: u64,
+        ) -> Result<Record<&'a [u8]>, Error> {
+            Ok(record.into_plain_record())
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+#[allow(dead_code)] // complete mock, but not 100% used in tests
+pub enum ClientStorageOp {
+    SetKxHint(ClientSessionKey<'static>, NamedGroup),
+    GetKxHint(ClientSessionKey<'static>, Option<NamedGroup>),
+    SetTls12Session(ClientSessionKey<'static>),
+    GetTls12Session(ClientSessionKey<'static>, bool),
+    RemoveTls12Session(ClientSessionKey<'static>),
+    InsertTls13Ticket(ClientSessionKey<'static>),
+    TakeTls13Ticket(ClientSessionKey<'static>, bool),
+}
+
+pub struct ClientStorage {
+    storage: Arc<dyn rustls::client::ClientSessionStore>,
+    ops: Mutex<Vec<ClientStorageOp>>,
+    alter_max_early_data_size: Option<(u32, u32)>,
+}
+
+impl ClientStorage {
+    pub fn new() -> Self {
+        Self {
+            storage: Arc::new(rustls::client::ClientSessionMemoryCache::new(1024)),
+            ops: Mutex::new(Vec::new()),
+            alter_max_early_data_size: None,
+        }
+    }
+
+    pub fn alter_max_early_data_size(&mut self, expected: u32, altered: u32) {
+        self.alter_max_early_data_size = Some((expected, altered));
+    }
+
+    pub fn ops(&self) -> Vec<ClientStorageOp> {
+        self.ops.lock().unwrap().clone()
+    }
+
+    pub fn ops_and_reset(&self) -> Vec<ClientStorageOp> {
+        mem::take(&mut self.ops.lock().unwrap())
+    }
+}
+
+impl fmt::Debug for ClientStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "(ops: {:?})", self.ops.lock().unwrap())
+    }
+}
+
+impl rustls::client::ClientSessionStore for ClientStorage {
+    fn set_kx_hint(&self, key: ClientSessionKey<'static>, group: NamedGroup) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::SetKxHint(key.clone(), group));
+        self.storage.set_kx_hint(key, group)
+    }
+
+    fn kx_hint(&self, key: &ClientSessionKey<'_>) -> Option<NamedGroup> {
+        let rc = self.storage.kx_hint(key);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::GetKxHint(key.to_owned(), rc));
+        rc
+    }
+
+    fn set_tls12_session(
+        &self,
+        key: ClientSessionKey<'static>,
+        value: rustls::client::Tls12Session,
+    ) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::SetTls12Session(key.clone()));
+        self.storage
+            .set_tls12_session(key, value)
+    }
+
+    fn tls12_session(&self, key: &ClientSessionKey<'_>) -> Option<rustls::client::Tls12Session> {
+        let rc = self.storage.tls12_session(key);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::GetTls12Session(
+                key.to_owned(),
+                rc.is_some(),
+            ));
+        rc
+    }
+
+    fn remove_tls12_session(&self, key: &ClientSessionKey<'static>) {
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::RemoveTls12Session(key.clone()));
+        self.storage.remove_tls12_session(key);
+    }
+
+    fn insert_tls13_ticket(&self, key: ClientSessionKey<'static>, mut value: Tls13Session) {
+        if let Some((expected, desired)) = self.alter_max_early_data_size {
+            value._reset_max_early_data_size(expected, desired);
+        }
+
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::InsertTls13Ticket(key.clone()));
+        self.storage
+            .insert_tls13_ticket(key, value);
+    }
+
+    fn take_tls13_ticket(&self, key: &ClientSessionKey<'static>) -> Option<Tls13Session> {
+        let rc = self.storage.take_tls13_ticket(key);
+        self.ops
+            .lock()
+            .unwrap()
+            .push(ClientStorageOp::TakeTls13Ticket(key.clone(), rc.is_some()));
+        rc
+    }
+}
+
+pub fn provider_with_one_suite(
+    provider: &CryptoProvider,
+    suite: SupportedCipherSuite,
+) -> CryptoProvider {
+    provider_with_suites(provider, &[suite])
+}
+
+pub fn provider_with_suites(
+    provider: &CryptoProvider,
+    suites: &[SupportedCipherSuite],
+) -> CryptoProvider {
+    let mut tls12_cipher_suites = vec![];
+    let mut tls13_cipher_suites = vec![];
+
+    for suite in suites {
+        match suite {
+            SupportedCipherSuite::Tls12(suite) => {
+                tls12_cipher_suites.push(*suite);
+            }
+            SupportedCipherSuite::Tls13(suite) => {
+                tls13_cipher_suites.push(*suite);
+            }
+            _ => unreachable!(),
+        }
+    }
+    CryptoProvider {
+        tls12_cipher_suites: Cow::Owned(tls12_cipher_suites),
+        tls13_cipher_suites: Cow::Owned(tls13_cipher_suites),
+        ..provider.clone()
+    }
+}
+
+#[cfg(feature = "ring")]
+pub use rustls_ring;
+
+pub mod macros {
+    //! Macros that bring a provider into the current scope.
+    //!
+    //! The selected provider module is bound as `provider`; you can rely on this
+    //! having the union of the public items common to the `rustls::crypto::ring`
+    //! and `rustls::crypto::aws_lc_rs` modules.
+
+    #[macro_export]
+    macro_rules! provider_ring {
+        () => {
+            #[allow(unused_imports)]
+            use $crate::rustls_ring as provider;
+            #[allow(dead_code)]
+            const fn provider_is_aws_lc_rs() -> bool {
+                false
+            }
+            #[allow(dead_code)]
+            const fn provider_is_ring() -> bool {
+                true
+            }
+            #[allow(dead_code)]
+            const fn provider_is_fips() -> bool {
+                false
+            }
+        };
+    }
+
+    #[macro_export]
+    macro_rules! provider_aws_lc_rs {
+        () => {
+            #[allow(unused_imports)]
+            use rustls_aws_lc_rs as provider;
+            #[allow(dead_code)]
+            const fn provider_is_aws_lc_rs() -> bool {
+                true
+            }
+            #[allow(dead_code)]
+            const fn provider_is_ring() -> bool {
+                false
+            }
+            #[allow(dead_code)]
+            const fn provider_is_fips() -> bool {
+                cfg!(feature = "fips")
+            }
+        };
+    }
+}
+
+/// Deeply inefficient, test-only TLS encoding helpers
+pub mod encoding {
+    use rustls::crypto::hpke::HpkeSuite;
+    use rustls::crypto::kx::NamedGroup;
+    use rustls::crypto::{CipherSuite, SignatureScheme};
+    use rustls::enums::{ContentType, HandshakeType, ProtocolVersion};
+    use rustls::error::AlertDescription;
+    use rustls::pki_types::EchConfigListBytes;
+
+    /// Return a client hello with mandatory extensions added to `extensions`
+    ///
+    /// The returned bytes are handshake-framed, but not message-framed.
+    pub fn basic_client_hello(mut extensions: Vec<Extension>) -> Vec<u8> {
+        extensions.push(Extension::new_kx_groups());
+        extensions.push(Extension::new_sig_algs());
+        extensions.push(Extension::new_versions());
+        extensions.push(Extension::new_dummy_key_share());
+        client_hello_with_extensions(extensions)
+    }
+
+    /// Return a client hello with exactly `extensions`
+    ///
+    /// The returned bytes are handshake-framed, but not message-framed.
+    pub fn client_hello_with_extensions(extensions: Vec<Extension>) -> Vec<u8> {
+        client_hello(
+            ProtocolVersion::TLSv1_2,
+            &[0u8; 32],
+            &[0],
+            vec![
+                CipherSuite::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256,
+                CipherSuite::TLS13_AES_128_GCM_SHA256,
+            ],
+            extensions,
+        )
+    }
+
+    pub fn client_hello(
+        legacy_version: ProtocolVersion,
+        random: &[u8; 32],
+        session_id: &[u8],
+        cipher_suites: Vec<CipherSuite>,
+        extensions: Vec<Extension>,
+    ) -> Vec<u8> {
+        let mut out = vec![];
+
+        out.extend_from_slice(&legacy_version.to_array());
+        out.extend_from_slice(random);
+        out.extend_from_slice(session_id);
+        out.extend(len_u16(vector_of(
+            cipher_suites
+                .into_iter()
+                .map(|cs| cs.to_array()),
+        )));
+        out.extend_from_slice(&[0x01, 0x00]); // only null compression
+
+        let mut exts = vec![];
+        for e in extensions {
+            exts.extend_from_slice(&e.typ.to_be_bytes());
+            exts.extend_from_slice(&(e.body.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&e.body);
+        }
+
+        out.extend(len_u16(exts));
+        handshake_framing(HandshakeType::ClientHello, out)
+    }
+
+    pub fn server_hello(
+        legacy_version: ProtocolVersion,
+        random: &[u8; 32],
+        session_id: &[u8],
+        cipher_suite: CipherSuite,
+        extensions: Vec<Extension>,
+    ) -> Vec<u8> {
+        let mut out = vec![];
+
+        out.extend_from_slice(&legacy_version.to_array());
+        out.extend_from_slice(random);
+        out.extend_from_slice(session_id);
+        out.extend_from_slice(&cipher_suite.to_array());
+        out.extend_from_slice(&[0x00]); // null compression
+
+        let mut exts = vec![];
+        for e in extensions {
+            exts.extend_from_slice(&e.typ.to_be_bytes());
+            exts.extend_from_slice(&(e.body.len() as u16).to_be_bytes());
+            exts.extend_from_slice(&e.body);
+        }
+
+        out.extend(len_u16(exts));
+        handshake_framing(HandshakeType::ServerHello, out)
+    }
+
+    /// Copy the `legacy_session_id` of the `ClientHello` at the front of `client_flight`
+    /// into the `ServerHello` at the front of `server_flight`.
+    ///
+    /// TLS1.3 requires a server to echo that value, so a `ServerHello` that was recorded,
+    /// synthesized, or produced for a different `ClientHello` needs adjusting before a
+    /// client accepts it.
+    pub fn echo_session_id(client_flight: &[u8], server_flight: &mut Vec<u8>) {
+        // record header, handshake header, legacy_version, then random
+        const LEN_OFFSET: usize = 5 + 4 + 2 + 32;
+
+        assert_eq!(client_flight[5], u8::from(HandshakeType::ClientHello));
+        assert_eq!(server_flight[5], u8::from(HandshakeType::ServerHello));
+
+        let client_len = usize::from(client_flight[LEN_OFFSET]);
+        let server_len = usize::from(server_flight[LEN_OFFSET]);
+
+        // the ids may differ in length, so the record and handshake lengths move too
+        let adjust = |len: usize| len + client_len - server_len;
+        let record_len = u16::from_be_bytes([server_flight[3], server_flight[4]]);
+        let record_len = adjust(usize::from(record_len)) as u16;
+        server_flight[3..5].copy_from_slice(&record_len.to_be_bytes());
+        let handshake_len =
+            u32::from_be_bytes([0, server_flight[6], server_flight[7], server_flight[8]]);
+        let handshake_len = adjust(handshake_len as usize) as u32;
+        server_flight[6..9].copy_from_slice(&handshake_len.to_be_bytes()[1..]);
+
+        server_flight.splice(
+            LEN_OFFSET..LEN_OFFSET + 1 + server_len,
+            client_flight[LEN_OFFSET..LEN_OFFSET + 1 + client_len]
+                .iter()
+                .copied(),
+        );
+    }
+
+    /// Apply handshake framing to `body`.
+    ///
+    /// This does not do fragmentation.
+    pub fn handshake_framing(ty: HandshakeType, body: Vec<u8>) -> Vec<u8> {
+        let mut body = len_u24(body);
+        body.splice(0..0, ty.to_array());
+        body
+    }
+
+    /// Apply message framing to `body`.
+    pub fn record_framing(ty: ContentType, vers: ProtocolVersion, body: Vec<u8>) -> Vec<u8> {
+        let mut body = len_u16(body);
+        body.splice(0..0, vers.to_array());
+        body.splice(0..0, ty.to_array());
+        body
+    }
+
+    #[derive(Clone)]
+    pub struct Extension {
+        pub typ: u16,
+        pub body: Vec<u8>,
+    }
+
+    impl Extension {
+        pub fn new_sig_algs() -> Self {
+            Self {
+                typ: Self::SIGNATURE_ALGORITHMS,
+                body: len_u16(vector_of(
+                    [
+                        SignatureScheme::ED25519,
+                        SignatureScheme::RSA_PSS_SHA256,
+                        SignatureScheme::ECDSA_NISTP256_SHA256,
+                    ]
+                    .map(|s| s.to_array()),
+                )),
+            }
+        }
+
+        pub fn new_kx_groups() -> Self {
+            Self {
+                typ: Self::ELLIPTIC_CURVES,
+                body: len_u16(vector_of([NamedGroup::secp256r1.to_array()])),
+            }
+        }
+
+        pub fn new_versions() -> Self {
+            Self {
+                typ: Self::SUPPORTED_VERSIONS,
+                body: len_u8(vector_of(
+                    [ProtocolVersion::TLSv1_3, ProtocolVersion::TLSv1_2].map(|v| v.to_array()),
+                )),
+            }
+        }
+
+        pub fn new_versions_server_tls13() -> Self {
+            Self {
+                typ: Self::SUPPORTED_VERSIONS,
+                body: ProtocolVersion::TLSv1_3
+                    .to_array()
+                    .to_vec(),
+            }
+        }
+
+        pub fn new_dummy_key_share() -> Self {
+            let mut share = len_u16(Self::SOME_POINT_ON_P256.to_vec());
+            share.splice(0..0, NamedGroup::secp256r1.to_array());
+
+            Self {
+                typ: Self::KEY_SHARE,
+                body: len_u16(share),
+            }
+        }
+
+        pub fn new_dummy_key_share_server() -> Self {
+            let mut share = len_u16(Self::SOME_POINT_ON_P256.to_vec());
+            share.splice(0..0, NamedGroup::secp256r1.to_array());
+
+            Self {
+                typ: Self::KEY_SHARE,
+                body: share,
+            }
+        }
+
+        pub fn new_quic_transport_params(body: &[u8]) -> Self {
+            Self {
+                typ: Self::TRANSPORT_PARAMETERS,
+                body: len_u16(body.to_vec()),
+            }
+        }
+
+        pub fn new_alpn(body: &[u8]) -> Self {
+            Self {
+                typ: Self::ALPN,
+                body: len_u16(body.to_vec()),
+            }
+        }
+
+        pub const ELLIPTIC_CURVES: u16 = 0x000a;
+        pub const SIGNATURE_ALGORITHMS: u16 = 0x000d;
+        pub const SUPPORTED_VERSIONS: u16 = 0x002b;
+        pub const KEY_SHARE: u16 = 0x0033;
+        pub const TRANSPORT_PARAMETERS: u16 = 0x0039;
+        pub const ALPN: u16 = 0x0010;
+
+        const SOME_POINT_ON_P256: &[u8] = &[
+            4, 41, 39, 177, 5, 18, 186, 227, 237, 220, 254, 70, 120, 40, 18, 139, 173, 41, 3, 38,
+            153, 25, 247, 8, 96, 105, 200, 196, 223, 108, 115, 40, 56, 199, 120, 121, 100, 234,
+            172, 0, 229, 146, 31, 177, 73, 138, 96, 244, 96, 103, 102, 179, 217, 104, 80, 1, 85,
+            141, 26, 151, 78, 115, 65, 81, 62,
+        ];
+    }
+
+    /// Return a full TLS message containing a fatal alert.
+    pub fn alert(desc: AlertDescription, suffix: &[u8]) -> Vec<u8> {
+        let mut body = vec![ALERT_LEVEL_FATAL, desc.into()];
+        body.extend_from_slice(suffix);
+        record_framing(ContentType::Alert, ProtocolVersion::TLSv1_2, body)
+    }
+
+    /// Return a full TLS message containing a warning alert.
+    pub fn warning_alert(desc: AlertDescription) -> Vec<u8> {
+        record_framing(
+            ContentType::Alert,
+            ProtocolVersion::TLSv1_2,
+            vec![ALERT_LEVEL_WARNING, desc.into()],
+        )
+    }
+
+    /// Return an `ECHConfigList` containing a single `ECHConfig` for `public_name`
+    ///
+    /// See <https://www.rfc-editor.org/info/rfc9849#section-4>.
+    pub fn ech_config_list(
+        suite: HpkeSuite,
+        public_key: &[u8],
+        public_name: &str,
+    ) -> EchConfigListBytes<'static> {
+        let mut contents = vec![0]; // config_id
+        contents.extend_from_slice(&suite.kem.to_array());
+        contents.extend(len_u16(public_key.to_vec()));
+        contents.extend(len_u16(vector_of([
+            suite.sym.kdf_id.to_array(),
+            suite.sym.aead_id.to_array(),
+        ])));
+        contents.push(0); // maximum_name_length
+        contents.extend(len_u8(public_name.as_bytes().to_vec()));
+        contents.extend(len_u16(vec![])); // extensions
+
+        let mut config = ECH_CONFIG_VERSION
+            .to_be_bytes()
+            .to_vec();
+        config.extend(len_u16(contents));
+        EchConfigListBytes::from(len_u16(config))
+    }
+
+    /// Prefix with u8 length
+    pub fn len_u8(mut body: Vec<u8>) -> Vec<u8> {
+        body.splice(0..0, [body.len() as u8]);
+        body
+    }
+
+    /// Prefix with u16 length
+    pub fn len_u16(mut body: Vec<u8>) -> Vec<u8> {
+        body.splice(0..0, (body.len() as u16).to_be_bytes());
+        body
+    }
+
+    /// Prefix with u24 length
+    pub fn len_u24(mut body: Vec<u8>) -> Vec<u8> {
+        let len = (body.len() as u32).to_be_bytes();
+        body.insert(0, len[1]);
+        body.insert(1, len[2]);
+        body.insert(2, len[3]);
+        body
+    }
+
+    /// Encode each of `items`
+    pub fn vector_of<const N: usize>(items: impl IntoIterator<Item = [u8; N]>) -> Vec<u8> {
+        items.into_iter().flatten().collect()
+    }
+
+    const ALERT_LEVEL_WARNING: u8 = 1;
+    const ALERT_LEVEL_FATAL: u8 = 2;
+    const ECH_CONFIG_VERSION: u16 = 0xfe0d;
+}
+
+/// A tracing subscriber that collects everything which was logged.
+#[derive(Debug)]
+pub struct CountingSubscriber {
+    inner: Arc<CountingInner>,
+    _guard: Option<subscriber::DefaultGuard>,
+}
+
+impl CountingSubscriber {
+    pub fn new() -> Self {
+        TracingBug2874Workaround::init();
+
+        let inner = Arc::new(CountingInner::default());
+        Self {
+            _guard: Some(subscriber::set_default(inner.clone())),
+            inner,
+        }
+    }
+
+    pub fn sample(&self) -> CountingData {
+        self.inner.data.lock().unwrap().clone()
+    }
+}
+
+#[derive(Debug, Default)]
+struct CountingInner {
+    data: Mutex<CountingData>,
+}
+
+impl subscriber::Subscriber for CountingInner {
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        true
+    }
+
+    fn event(&self, event: &Event<'_>) {
+        let level = *event.metadata().level();
+        let mut message = MessageVisitor::default();
+        event.record(&mut message);
+        println!("logging at {level:?}: {}", message.0);
+
+        self.data
+            .lock()
+            .unwrap()
+            .add(level, message.0);
+    }
+
+    // rustls emits events, never spans, so the span-related items are stubs.
+
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}
+
+/// Collects the `message` field of an event: the formatted format string.
+#[derive(Default)]
+struct MessageVisitor(String);
+
+impl field::Visit for MessageVisitor {
+    fn record_debug(&mut self, field: &field::Field, value: &dyn fmt::Debug) {
+        if field.name() == "message" {
+            self.0 = format!("{value:?}");
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct CountingData {
+    pub trace: Vec<String>,
+    pub debug: Vec<String>,
+    pub info: Vec<String>,
+    pub warn: Vec<String>,
+    pub error: Vec<String>,
+}
+
+impl CountingData {
+    fn add(&mut self, level: Level, message: String) {
+        match level {
+            Level::TRACE => &mut self.trace,
+            Level::DEBUG => &mut self.debug,
+            Level::INFO => &mut self.info,
+            Level::WARN => &mut self.warn,
+            Level::ERROR => &mut self.error,
+        }
+        .push(message);
+    }
+}
+
+#[derive(Debug)]
+struct TracingBug2874Workaround;
+
+impl TracingBug2874Workaround {
+    fn init() {
+        static FLOOR: OnceLock<()> = OnceLock::new();
+        FLOOR.get_or_init(|| {
+            subscriber::set_global_default(Self).unwrap();
+            tracing::callsite::rebuild_interest_cache();
+        });
+    }
+}
+
+impl subscriber::Subscriber for TracingBug2874Workaround {
+    fn register_callsite(&self, _metadata: &Metadata<'_>) -> subscriber::Interest {
+        subscriber::Interest::sometimes()
+    }
+
+    fn enabled(&self, _metadata: &Metadata<'_>) -> bool {
+        false
+    }
+
+    fn event(&self, _event: &Event<'_>) {}
+
+    fn new_span(&self, _span: &span::Attributes<'_>) -> span::Id {
+        span::Id::from_u64(1)
+    }
+
+    fn record(&self, _span: &span::Id, _values: &span::Record<'_>) {}
+
+    fn record_follows_from(&self, _span: &span::Id, _follows: &span::Id) {}
+
+    fn enter(&self, _span: &span::Id) {}
+
+    fn exit(&self, _span: &span::Id) {}
+}

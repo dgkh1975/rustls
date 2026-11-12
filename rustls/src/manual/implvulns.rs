@@ -53,7 +53,7 @@ states that look like:
 ```ignore
 struct ExpectTraffic {
    (...)
-    _cert_verified: verify::ServerCertVerified,
+    _cert_verified: verify::PeerVerified,
     _sig_verified: verify::HandshakeSignatureValid,
     _fin_verified: verify::FinishedMessageVerified,
 }
@@ -72,7 +72,7 @@ to data being encrypted with the wrong keys (specifically, keys which were not s
 from OpenSSL taking a *reactive* strategy to incoming messages ("when I get a message X, I should do Y")
 which allows it to diverge from the proper state machine under attacker control.
 
-[SMACK](https://mitls.org/pages/attacks/SMACK) is a similar suite of vulnerabilities found in JSSE,
+[SMACK](https://web.archive.org/web/mitls.org/pages/attacks/SMACK) is a similar suite of vulnerabilities found in JSSE,
 CyaSSL, OpenSSL, Mono and axTLS.  "SKIP-TLS" demonstrated that some implementations allowed handshake
 messages (and in one case, the entire handshake!) to be skipped leading to breaks in security.  "FREAK"
 found that some implementations incorrectly allowed export-only state transitions (i.e., transitions that
@@ -86,12 +86,12 @@ the message type before further operations.
 
 A sample sequence for a full TLSv1.2 handshake by a client looks like:
 
-- `hs::ExpectServerHello` (nb. ClientHello is logically sent before this state); transition to `tls12::ExpectCertificate`
-- `tls12::ExpectCertificate`; transition to `tls12::ExpectServerKX`
-- `tls12::ExpectServerKX`; transition to `tls12::ExpectServerDoneOrCertReq`
+- `hs::ExpectServerHello` (Note: ClientHello is logically sent before this state); transition to `tls12::ExpectCertificate`
+- `tls12::ExpectCertificate`; transition to `tls12::ExpectServerKx`
+- `tls12::ExpectServerKx`; transition to `tls12::ExpectServerDoneOrCertReq`
 - `tls12::ExpectServerDoneOrCertReq`; delegates to `tls12::ExpectCertificateRequest` or `tls12::ExpectServerDone` depending on incoming message.
-  - `tls12::ExpectServerDone`; transition to `tls12::ExpectCCS`
-- `tls12::ExpectCCS`; transition to `tls12::ExpectFinished`
+  - `tls12::ExpectServerDone`; transition to `tls12::ExpectCcs`
+- `tls12::ExpectCcs`; transition to `tls12::ExpectFinished`
 - `tls12::ExpectFinished`; transition to `tls12::ExpectTraffic`
 - `tls12::ExpectTraffic`; terminal state; transitions to `tls12::ExpectTraffic`
 

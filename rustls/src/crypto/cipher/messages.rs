@@ -1,0 +1,866 @@
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut, Range};
+use core::{fmt, slice};
+
+use crate::Protocol;
+use crate::enums::{ContentType, ProtocolVersion};
+use crate::error::{Error, InvalidMessage, PeerMisbehaved};
+use crate::msgs::{Codec, HEADER_SIZE, MAX_FRAGMENT_LEN, Reader, hex, read_record_header};
+
+/// A TLS record with encoded (but not necessarily encrypted) payload.
+#[expect(clippy::exhaustive_structs)]
+#[derive(Clone, Debug)]
+pub struct Record<P> {
+    /// The content type of this record.
+    pub typ: ContentType,
+    /// The protocol version of this record.
+    pub version: EncodableVersion,
+    /// The payload of this record.
+    pub payload: P,
+}
+
+impl<P> Record<P> {
+    /// Create a new `Record` with the given fields.
+    pub fn new(typ: ContentType, version: EncodableVersion, payload: P) -> Self {
+        Self {
+            typ,
+            version,
+            payload,
+        }
+    }
+}
+
+impl<'a> Record<Payload<'a>> {
+    /// Construct by decoding from a [`Reader`].
+    ///
+    /// `RecordError` allows callers to distinguish between valid prefixes (might
+    /// become valid if we read more data) and invalid data.
+    pub(crate) fn read(r: &mut Reader<'a>) -> Result<Self, RecordError> {
+        let (typ, version, len) = read_record_header(r)?;
+
+        let content = r
+            .take(len as usize)
+            .ok_or(RecordError::TooShortForLength)?;
+
+        Ok(Self {
+            typ,
+            version: EncodableVersion::Legacy(version),
+            payload: Payload::Borrowed(content),
+        })
+    }
+
+    /// Borrow as an [`Record<OutboundPlain<'a>>`].
+    pub fn borrow_outbound(&'a self) -> Record<OutboundPlain<'a>> {
+        Record {
+            typ: self.typ,
+            version: self.version,
+            payload: self.payload.bytes().into(),
+        }
+    }
+
+    /// Convert into an owned `Record<Payload<'static>>`.
+    pub fn into_owned(self) -> Record<Payload<'static>> {
+        Record {
+            typ: self.typ,
+            version: self.version,
+            payload: self.payload.into_owned(),
+        }
+    }
+}
+
+impl Record<&'_ [u8]> {
+    /// Returns true if the payload is a CCS message.
+    ///
+    /// We passthrough ChangeCipherSpec messages in the deframer without decrypting them.
+    /// Note: this is prior to the record layer, so is unencrypted. See
+    /// third paragraph of section 5 in RFC 9846.
+    pub(crate) fn is_valid_ccs(&self) -> bool {
+        self.typ == ContentType::ChangeCipherSpec && self.payload == [0x01]
+    }
+}
+
+impl<'a> Record<InboundOpaque<'a>> {
+    /// For TLS1.3 (only), checks the length record.payload is valid and removes the padding.
+    ///
+    /// Returns an error if the record payload (pre-unpadding) is too long, or the padding is invalid,
+    /// or the inner content type is `change_cipher_spec`.
+    pub fn into_tls13_unpadded_record(mut self) -> Result<Record<&'a [u8]>, Error> {
+        let payload = &mut self.payload;
+
+        if self.typ != ContentType::ApplicationData {
+            return Err(PeerMisbehaved::IllegalTls13ContentType.into());
+        }
+
+        if payload.len() > MAX_FRAGMENT_LEN.get() + 1 {
+            return Err(Error::PeerSentOversizedRecord);
+        }
+
+        self.typ = unpad_tls13_payload(payload);
+        if self.typ == ContentType(0) {
+            return Err(PeerMisbehaved::IllegalTlsInnerPlaintext.into());
+        }
+
+        // > An implementation which receives any other change_cipher_spec value or
+        // > which receives a protected change_cipher_spec record MUST abort the
+        // > handshake with an "unexpected_message" alert.
+        // <https://www.rfc-editor.org/info/rfc9846#section-5>
+        if self.typ == ContentType::ChangeCipherSpec {
+            return Err(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec.into());
+        }
+
+        self.version = EncodableVersion::Legacy(ProtocolVersion::TLSv1_3);
+        Ok(self.into_plain_record())
+    }
+
+    /// Force conversion into a plaintext record.
+    ///
+    /// `range` restricts the resulting record: this function panics if it is out of range for
+    /// the underlying record payload.
+    ///
+    /// This should only be used for records that are known to be in plaintext. Otherwise, the
+    /// [`Record<InboundOpaque<'_>>`] should be decrypted into an
+    /// `Record<&'_ [u8]>` using a `RecordDecrypter`.
+    pub fn into_plain_record_range(self, range: Range<usize>) -> Record<&'a [u8]> {
+        Record {
+            typ: self.typ,
+            version: self.version,
+            payload: &self.payload.into_inner()[range],
+        }
+    }
+
+    /// Force conversion into a plaintext record.
+    ///
+    /// This should only be used for records that are known to be in plaintext. Otherwise, the
+    /// [`Record<InboundOpaque<'a>>`] should be decrypted into a
+    /// `Record<&'a [u8]>` using a `RecordDecrypter`.
+    pub fn into_plain_record(self) -> Record<&'a [u8]> {
+        Record {
+            typ: self.typ,
+            version: self.version,
+            payload: self.payload.into_inner(),
+        }
+    }
+}
+
+impl Record<OutboundPlain<'_>> {
+    /// Encode this record into its unencrypted wire representation, including
+    /// its record header.
+    pub(crate) fn to_unencrypted_bytes(&self) -> Vec<u8> {
+        let len = self.payload.len();
+        debug_assert!(len <= usize::from(u16::MAX));
+        let mut buf = Vec::with_capacity(HEADER_SIZE + len);
+        self.encode_unencrypted(&mut buf);
+        buf
+    }
+
+    pub(crate) fn encode_unencrypted(&self, buf: &mut Vec<u8>) {
+        let len = self.payload.len();
+        debug_assert!(len <= usize::from(u16::MAX));
+        buf.extend_from_slice(&encode_record_header(self.typ, self.version, len as u16));
+        self.payload.copy_to_vec(buf);
+    }
+}
+
+/// Encode a TLS record header.
+///
+/// `typ`, `version` and `len` describe the record's payload.
+pub fn encode_record_header(
+    typ: ContentType,
+    version: EncodableVersion,
+    len: u16,
+) -> [u8; HEADER_SIZE] {
+    let [version_hi, version_lo] = version.encode().to_array();
+    let [len_hi, len_lo] = len.to_be_bytes();
+    [typ.into(), version_hi, version_lo, len_hi, len_lo]
+}
+
+/// A collection of borrowed plaintext slices.
+///
+/// Warning: OutboundPlain does not guarantee that the simplest variant is used.
+/// Multiple can hold non fragmented or empty payloads.
+#[non_exhaustive]
+#[derive(Debug, Clone)]
+pub enum OutboundPlain<'a> {
+    /// A single byte slice.
+    ///
+    /// Contrary to `Multiple`, this uses a single pointer indirection
+    Single(&'a [u8]),
+    /// A collection of chunks (byte slices).
+    Multiple {
+        /// A collection of byte slices that hold the buffered data.
+        chunks: &'a [&'a [u8]],
+        /// Offset of the payload's first byte within the logical
+        /// concatenation of all `chunks`.
+        ///
+        /// This may point beyond the first chunk.
+        start: usize,
+        /// Offset one past the payload's last byte within the logical
+        /// concatenation of all `chunks`, so `end - start` is the payload's
+        /// length in bytes.
+        end: usize,
+    },
+}
+
+impl<'a> OutboundPlain<'a> {
+    /// Create a payload from a slice of byte slices.
+    /// If fragmented the cursors are added by default: start = 0, end = length
+    pub fn new(chunks: &'a [&'a [u8]]) -> Self {
+        if chunks.len() == 1 {
+            Self::Single(chunks[0])
+        } else {
+            Self::Multiple {
+                chunks,
+                start: 0,
+                end: chunks
+                    .iter()
+                    .map(|chunk| chunk.len())
+                    .sum(),
+            }
+        }
+    }
+
+    /// Create a payload with a single empty slice
+    pub fn new_empty() -> Self {
+        Self::Single(&[])
+    }
+
+    /// Flatten the slice of byte slices to an owned vector of bytes
+    pub fn to_vec(&self) -> Vec<u8> {
+        let mut vec = Vec::with_capacity(self.len());
+        self.copy_to_vec(&mut vec);
+        vec
+    }
+
+    /// Append all bytes to a vector
+    pub fn copy_to_vec(&self, vec: &mut Vec<u8>) {
+        for chunk in self.chunks() {
+            vec.extend_from_slice(chunk);
+        }
+    }
+
+    /// Iterate over the payload's chunks of bytes, in order.
+    ///
+    /// Empty chunks are not yielded.
+    pub fn chunks(&self) -> impl Iterator<Item = &'a [u8]> + '_ {
+        match self {
+            Self::Single(chunk) => Chunks::Single((!chunk.is_empty()).then_some(*chunk)),
+            Self::Multiple { chunks, start, end } => Chunks::Multiple {
+                chunks: chunks.iter(),
+                skip: *start,
+                remaining: end - start,
+            },
+        }
+    }
+
+    /// The payload's single contiguous chunk, or `None` if it is fragmented.
+    ///
+    /// An empty payload is treated as a single empty chunk. A [`Self::Multiple`]
+    /// payload is contiguous when its selected range lies within one chunk.
+    /// Distinct chunks are never joined, even if their addresses are adjacent.
+    pub fn single_chunk(&self) -> Option<&'a [u8]> {
+        if let Self::Single(chunk) = self {
+            return Some(chunk);
+        }
+        if self.is_empty() {
+            return Some(&[]);
+        }
+        let mut chunks = self.chunks();
+        let chunk = chunks.next()?;
+        (chunk.len() == self.len() && chunks.next().is_none()).then_some(chunk)
+    }
+
+    /// Split self in two, around an index
+    /// Works similarly to `split_at` in the core library, except it doesn't panic if out of bound
+    pub(crate) fn split_at(&self, mid: usize) -> (Self, Self) {
+        let (chunks, start, end) = match *self {
+            Self::Multiple { chunks, start, end } => (chunks, start, end),
+            Self::Single(chunk) => {
+                let mid = Ord::min(mid, chunk.len());
+                return (Self::Single(&chunk[..mid]), Self::Single(&chunk[mid..]));
+            }
+        };
+
+        let mid = Ord::min(start + mid, end);
+        let mut skip = 0;
+        let mut consumed = 0;
+        for chunk in chunks {
+            if consumed + chunk.len() > mid {
+                break;
+            }
+            consumed += chunk.len();
+            skip += 1;
+        }
+
+        (
+            Self::Multiple {
+                chunks,
+                start,
+                end: mid,
+            },
+            Self::Multiple {
+                chunks: &chunks[skip..],
+                start: mid - consumed,
+                end: end - consumed,
+            },
+        )
+    }
+
+    /// Returns true if the payload is empty
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len() == 0
+    }
+
+    /// Returns the cumulative length of all chunks
+    #[expect(clippy::len_without_is_empty)]
+    pub fn len(&self) -> usize {
+        match self {
+            Self::Single(chunk) => chunk.len(),
+            Self::Multiple { start, end, .. } => end - start,
+        }
+    }
+}
+
+/// Iterator over an [`OutboundPlain`]'s chunks, returned by [`OutboundPlain::chunks()`].
+enum Chunks<'a> {
+    Single(Option<&'a [u8]>),
+    Multiple {
+        /// Chunks not yet visited, including any leading ones `skip` covers.
+        chunks: slice::Iter<'a, &'a [u8]>,
+        /// How many leading bytes remain to be skipped.
+        skip: usize,
+        /// How many bytes remain to be yielded.
+        remaining: usize,
+    },
+}
+
+impl<'a> Iterator for Chunks<'a> {
+    type Item = &'a [u8];
+
+    fn next(&mut self) -> Option<Self::Item> {
+        let (chunks, skip, remaining) = match self {
+            Self::Single(chunk) => return chunk.take(),
+            Self::Multiple {
+                chunks,
+                skip,
+                remaining,
+            } => (chunks, skip, remaining),
+        };
+
+        loop {
+            if *remaining == 0 {
+                return None;
+            }
+
+            let chunk = chunks.next()?;
+            let Some((_, chunk)) = chunk.split_at_checked(*skip) else {
+                *skip -= chunk.len();
+                continue;
+            };
+
+            *skip = 0;
+            if chunk.is_empty() {
+                continue;
+            }
+
+            let take = Ord::min(chunk.len(), *remaining);
+            *remaining -= take;
+            return Some(&chunk[..take]);
+        }
+    }
+}
+
+impl<'a> From<&'a [u8]> for OutboundPlain<'a> {
+    fn from(payload: &'a [u8]) -> Self {
+        Self::Single(payload)
+    }
+}
+
+impl<'a, const N: usize> From<&'a [u8; N]> for OutboundPlain<'a> {
+    fn from(payload: &'a [u8; N]) -> Self {
+        Self::Single(payload)
+    }
+}
+
+impl<'a> From<&'a Vec<u8>> for OutboundPlain<'a> {
+    fn from(payload: &'a Vec<u8>) -> Self {
+        Self::Single(payload)
+    }
+}
+
+/// An externally length'd payload
+#[non_exhaustive]
+#[derive(Clone, Eq, PartialEq)]
+pub enum Payload<'a> {
+    /// Borrowed payload
+    Borrowed(&'a [u8]),
+    /// Owned payload
+    Owned(Vec<u8>),
+}
+
+impl<'a> Payload<'a> {
+    /// A reference to the payload's bytes
+    pub fn bytes(&'a self) -> &'a [u8] {
+        match self {
+            Self::Borrowed(bytes) => bytes,
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn into_owned(self) -> Payload<'static> {
+        Payload::Owned(self.into_vec())
+    }
+
+    pub(crate) fn into_vec(self) -> Vec<u8> {
+        match self {
+            Self::Borrowed(bytes) => bytes.to_vec(),
+            Self::Owned(bytes) => bytes,
+        }
+    }
+
+    pub(crate) fn read(r: &mut Reader<'a>) -> Self {
+        Self::Borrowed(r.rest())
+    }
+}
+
+impl Payload<'static> {
+    /// Create a new owned payload from the given `bytes`.
+    pub fn new(bytes: impl Into<Vec<u8>>) -> Self {
+        Self::Owned(bytes.into())
+    }
+}
+
+impl<'a> Codec<'a> for Payload<'a> {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        bytes.extend_from_slice(self.bytes());
+    }
+
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        Ok(Self::read(r))
+    }
+}
+
+impl fmt::Debug for Payload<'_> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hex(f, self.bytes())
+    }
+}
+
+/// A borrowed payload buffer.
+#[expect(clippy::exhaustive_structs)]
+pub struct InboundOpaque<'a>(pub &'a mut [u8]);
+
+impl<'a> InboundOpaque<'a> {
+    /// Truncate the payload to `len` bytes.
+    pub fn truncate(&mut self, len: usize) {
+        if len >= self.len() {
+            return;
+        }
+
+        self.0 = core::mem::take(&mut self.0)
+            .split_at_mut(len)
+            .0;
+    }
+
+    pub(crate) fn into_inner(self) -> &'a mut [u8] {
+        self.0
+    }
+
+    pub(crate) fn pop(&mut self) -> Option<u8> {
+        if self.is_empty() {
+            return None;
+        }
+
+        let len = self.len();
+        let last = self[len - 1];
+        self.truncate(len - 1);
+        Some(last)
+    }
+}
+
+impl Deref for InboundOpaque<'_> {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        self.0
+    }
+}
+
+impl DerefMut for InboundOpaque<'_> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        self.0
+    }
+}
+
+/// A protocol version that can be encoded.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EncodableVersion {
+    /// Encode the version in legacy, backward-compatible form.
+    ///
+    /// > MUST be set to 0x0303 for all records generated by a TLS 1.3
+    /// > implementation...
+    ///
+    /// <https://www.rfc-editor.org/info/rfc9846/#section-5.1>
+    Legacy(ProtocolVersion),
+    /// Encode the version as an initial client hello, not a retry.
+    ///
+    /// > ...other than an initial ClientHello (i.e., one not generated after a HelloRetryRequest),
+    /// > where it MAY also be 0x0301 for compatibility purposes.
+    ///
+    /// <https://www.rfc-editor.org/info/rfc9846/#section-5.1>
+    InitialClientHello(Protocol),
+}
+
+impl EncodableVersion {
+    /// Encode the protocol version.
+    pub fn encode(&self) -> ProtocolVersion {
+        match self {
+            Self::Legacy(_) => ProtocolVersion::TLSv1_2,
+            Self::InitialClientHello(Protocol::Tcp | Protocol::Quic(_)) => ProtocolVersion::TLSv1_0,
+        }
+    }
+
+    /// The actual protocol version in use.
+    pub fn version(&self) -> ProtocolVersion {
+        match self {
+            Self::Legacy(v) => *v,
+            Self::InitialClientHello(Protocol::Tcp | Protocol::Quic(_)) => ProtocolVersion::TLSv1_2,
+        }
+    }
+}
+
+/// Decode a TLS1.3 `TLSInnerPlaintext` encoding.
+///
+/// `p` is a record payload, immediately post-decryption.  This function
+/// removes zero padding bytes, until a non-zero byte is encountered which is
+/// the content type, which is returned.  See RFC 9846 s5.2.
+///
+/// ContentType(0) is returned if the record payload is empty or all zeroes.
+fn unpad_tls13_payload(p: &mut InboundOpaque<'_>) -> ContentType {
+    loop {
+        match p.pop() {
+            Some(0) => {}
+            Some(content_type) => return ContentType::from(content_type),
+            None => return ContentType(0),
+        }
+    }
+}
+
+/// Errors from trying to parse a TLS record.
+#[expect(missing_docs)]
+#[non_exhaustive]
+#[derive(Debug)]
+pub enum RecordError {
+    TooShortForHeader,
+    TooShortForLength,
+    InvalidEmptyPayload,
+    MessageTooLarge,
+    InvalidContentType,
+    UnknownProtocolVersion,
+}
+
+#[cfg(test)]
+mod tests {
+    use std::{println, vec};
+
+    use super::*;
+    use crate::quic;
+
+    #[test]
+    fn single_chunk_with_multiple_slices() {
+        let chunks: &[&[u8]] = &[&[], &[1, 2, 3], &[], &[4, 5, 6, 7], &[]];
+        let expected = [1, 2, 3, 4, 5, 6, 7];
+        for start in 0..=7 {
+            for end in start..=7 {
+                let (_, tail) = OutboundPlain::new(chunks).split_at(start);
+                let (plain, _) = tail.split_at(end - start);
+                let contiguous = start == end || end <= 3 || start >= 3;
+                let single_chunk = plain.single_chunk();
+                assert_eq!(single_chunk.is_some(), contiguous);
+                let Some(slice) = single_chunk else {
+                    continue;
+                };
+                assert_eq!(slice, &expected[start..end]);
+                if !slice.is_empty() {
+                    let source = if end <= 3 { chunks[1] } else { chunks[3] };
+                    let offset = if end <= 3 { start } else { start - 3 };
+                    assert_eq!(slice.as_ptr(), source[offset..].as_ptr());
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn single_chunk_with_out_of_bounds_range() {
+        for start in [3, 5, 6] {
+            let plain = OutboundPlain::Multiple {
+                chunks: &[&[1, 2, 3], &[], &[4, 5], &[]],
+                start,
+                end: 7,
+            };
+            assert!(plain.single_chunk().is_none());
+        }
+    }
+
+    #[test]
+    fn single_chunk_borrows_payload() {
+        let data = [1, 2, 3];
+        let chunks: &[&[u8]] = &[&[], &data, &[]];
+        let slice = {
+            let plain = OutboundPlain::Multiple {
+                chunks,
+                start: 1,
+                end: 3,
+            };
+            plain.single_chunk().unwrap()
+        };
+        assert_eq!(slice, &data[1..]);
+        assert_eq!(slice.as_ptr(), data[1..].as_ptr());
+    }
+
+    #[test]
+    fn single_chunk_does_not_join_adjacent_slices() {
+        let owner = [1, 2, 3, 4];
+        let adjacent = [&owner[..2], &owner[2..]];
+        assert!(
+            OutboundPlain::new(&adjacent)
+                .single_chunk()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn single_chunk_empty_and_single_payloads() {
+        for plain in [
+            OutboundPlain::new_empty(),
+            OutboundPlain::new(&[]),
+            OutboundPlain::new(&[&[], &[]]),
+        ] {
+            assert_eq!(plain.single_chunk(), Some(&[][..]));
+        }
+        let data = [1, 2, 3];
+        for plain in [
+            OutboundPlain::from(data.as_slice()),
+            OutboundPlain::new(&[&data]),
+        ] {
+            let slice = plain.single_chunk().unwrap();
+            assert_eq!(slice, data);
+            assert_eq!(slice.as_ptr(), data.as_ptr());
+        }
+    }
+
+    #[test]
+    fn chunks_iteration() {
+        // `Single` yields its chunk, unless empty
+        assert_eq!(
+            OutboundPlain::Single(&[1, 2, 3])
+                .chunks()
+                .collect::<Vec<_>>(),
+            [&[1u8, 2, 3][..]],
+        );
+        assert_eq!(
+            OutboundPlain::new_empty()
+                .chunks()
+                .count(),
+            0
+        );
+
+        // `Multiple` yields the in-window part of each chunk, skipping
+        // empty chunks
+        let owner: Vec<&[u8]> = vec![&[], &[1, 2, 3], &[], &[4, 5], &[], &[6, 7], &[]];
+        let (_, tail) = OutboundPlain::new(&owner).split_at(1);
+        let (window, _) = tail.split_at(5);
+        assert_eq!(
+            window.chunks().collect::<Vec<_>>(),
+            [&[2u8, 3][..], &[4, 5][..], &[6][..]],
+        );
+    }
+
+    #[test]
+    fn split_at_with_single_slice() {
+        let owner: &[u8] = &[0, 1, 2, 3, 4, 5, 6, 7];
+        let borrowed_payload = OutboundPlain::Single(owner);
+
+        let (before, after) = borrowed_payload.split_at(6);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3, 4, 5]);
+        assert_eq!(after.to_vec(), &[6, 7]);
+    }
+
+    #[test]
+    fn split_at_with_multiple_slices() {
+        let owner: Vec<&[u8]> = vec![&[0, 1, 2, 3], &[4, 5], &[6, 7, 8], &[9, 10, 11, 12]];
+        let borrowed_payload = OutboundPlain::new(&owner);
+
+        let (before, after) = borrowed_payload.split_at(3);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2]);
+        assert_eq!(after.to_vec(), &[3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+
+        let (before, after) = borrowed_payload.split_at(8);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3, 4, 5, 6, 7]);
+        assert_eq!(after.to_vec(), &[8, 9, 10, 11, 12]);
+
+        let (before, after) = borrowed_payload.split_at(11);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10]);
+        assert_eq!(after.to_vec(), &[11, 12]);
+    }
+
+    #[test]
+    fn split_at_drops_consumed_chunks() {
+        let owner = vec![&[0, 1, 2][..], &[], &[3, 4], &[5], &[]];
+        let payload = OutboundPlain::new(&owner);
+
+        let (before, after) = payload.split_at(4);
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3]);
+        assert_eq!(after.to_vec(), &[4, 5]);
+        let OutboundPlain::Multiple { chunks, start, end } = after else {
+            panic!("expected multiple chunks");
+        };
+        assert_eq!(chunks, &owner[2..]);
+        assert_eq!((start, end), (1, 3));
+
+        let (before, after) = after.split_at(1);
+        assert_eq!(before.to_vec(), &[4]);
+        assert_eq!(after.to_vec(), &[5]);
+        let OutboundPlain::Multiple { chunks, start, end } = after else {
+            panic!("expected multiple chunks");
+        };
+        assert_eq!(chunks, &owner[3..]);
+        assert_eq!((start, end), (0, 1));
+
+        let (before, after) = after.split_at(1);
+        assert_eq!(before.to_vec(), &[5]);
+        assert!(after.is_empty());
+        let OutboundPlain::Multiple { chunks, start, end } = after else {
+            panic!("expected multiple chunks");
+        };
+        assert!(chunks.is_empty());
+        assert_eq!((start, end), (0, 0));
+    }
+
+    #[test]
+    fn split_out_of_bounds() {
+        let owner: Vec<&[u8]> = vec![&[0, 1, 2, 3], &[4, 5], &[6, 7, 8], &[9, 10, 11, 12]];
+
+        let single_payload = OutboundPlain::Single(owner[0]);
+        let (before, after) = single_payload.split_at(17);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3]);
+        assert!(after.is_empty());
+
+        let multiple_payload = OutboundPlain::new(&owner);
+        let (before, after) = multiple_payload.split_at(17);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert_eq!(before.to_vec(), &[0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12]);
+        assert!(after.is_empty());
+
+        let empty_payload = OutboundPlain::new_empty();
+        let (before, after) = empty_payload.split_at(17);
+        println!("before:{before:?}\nafter:{after:?}");
+        assert!(before.is_empty());
+        assert!(after.is_empty());
+    }
+
+    #[test]
+    fn empty_slices_mixed() {
+        let owner: Vec<&[u8]> = vec![&[], &[], &[0], &[], &[1, 2], &[], &[3], &[4], &[], &[]];
+        let mut borrowed_payload = OutboundPlain::new(&owner);
+        let mut fragment_count = 0;
+        let mut fragment;
+        let expected_fragments: &[&[u8]] = &[&[0, 1], &[2, 3], &[4]];
+
+        while !borrowed_payload.is_empty() {
+            (fragment, borrowed_payload) = borrowed_payload.split_at(2);
+            println!("{fragment:?}");
+            assert_eq!(&expected_fragments[fragment_count], &fragment.to_vec());
+            fragment_count += 1;
+        }
+        assert_eq!(fragment_count, expected_fragments.len());
+    }
+
+    #[test]
+    fn exhaustive_splitting() {
+        let owner: Vec<u8> = (0..127).collect();
+        let slices = (0..7)
+            .map(|i| &owner[((1 << i) - 1)..((1 << (i + 1)) - 1)])
+            .collect::<Vec<_>>();
+        let payload = OutboundPlain::new(&slices);
+
+        assert_eq!(payload.to_vec(), owner);
+        println!("{payload:#?}");
+
+        for start in 0..128 {
+            for end in start..128 {
+                for mid in 0..(end - start) {
+                    let witness = owner[start..end].split_at(mid);
+                    let split_payload = payload
+                        .split_at(end)
+                        .0
+                        .split_at(start)
+                        .1
+                        .split_at(mid);
+                    assert_eq!(
+                        witness.0,
+                        split_payload.0.to_vec(),
+                        "start: {start}, mid:{mid}, end:{end}"
+                    );
+                    assert_eq!(
+                        witness.1,
+                        split_payload.1.to_vec(),
+                        "start: {start}, mid:{mid}, end:{end}"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn tls13_unpadded_record_rejects_protected_change_cipher_spec() {
+        let mut payload = [0x01u8, ContentType::ChangeCipherSpec.into(), 0x00];
+        let record = Record {
+            typ: ContentType::ApplicationData,
+            version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+            payload: InboundOpaque(&mut payload),
+        };
+        assert_eq!(
+            record
+                .into_tls13_unpadded_record()
+                .unwrap_err(),
+            Error::PeerMisbehaved(PeerMisbehaved::IllegalMiddleboxChangeCipherSpec)
+        );
+    }
+
+    #[test]
+    fn record_encoding_version() {
+        for (version, expect) in [
+            (
+                EncodableVersion::InitialClientHello(Protocol::Tcp),
+                ProtocolVersion::TLSv1_0,
+            ),
+            (
+                EncodableVersion::InitialClientHello(Protocol::Quic(quic::Version::V2)),
+                ProtocolVersion::TLSv1_0,
+            ),
+            (
+                EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+                ProtocolVersion::TLSv1_2,
+            ),
+            (
+                EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+                ProtocolVersion::TLSv1_2,
+            ),
+        ] {
+            let record = Record {
+                typ: ContentType::Handshake,
+                version,
+                payload: OutboundPlain::Single(&[0, 1, 2, 3, 4]),
+            };
+            let encoded = record.to_unencrypted_bytes();
+            let decoded = Record::<Payload<'_>>::read(&mut Reader::new(&encoded)).unwrap();
+            assert_eq!(decoded.version.version(), expect);
+        }
+    }
+}

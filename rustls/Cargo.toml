@@ -1,54 +1,62 @@
 [package]
 name = "rustls"
-version = "0.19.0"
-edition = "2018"
-authors = ["Joseph Birr-Pixton <jpixton@gmail.com>"]
-license = "Apache-2.0/ISC/MIT"
+version = "0.24.0-dev.2"
+edition.workspace = true
+rust-version = "1.85"
+license = "Apache-2.0 OR ISC OR MIT"
 readme = "../README.md"
 description = "Rustls is a modern TLS library written in Rust."
-homepage = "https://github.com/ctz/rustls"
-repository = "https://github.com/ctz/rustls"
+homepage = "https://rustls.dev/"
+repository = "https://github.com/rustls/rustls"
 categories = ["network-programming", "cryptography"]
 autobenches = false
-
-[dependencies]
-log = { version = "0.4.4", optional = true }
-ring = "0.16.19"
-sct = "0.6.0"
-webpki = "0.21.4"
+autotests = false
+exclude = ["src/testdata", "tests/**"]
 
 [features]
-default = ["logging"]
-logging = ["log"]
-dangerous_configuration = []
-quic = []
+default = ["std", "tracing", "webpki"]
+brotli = ["dep:brotli", "dep:brotli-decompressor"]
+std = ["pki-types/std"]
+tracing = ["dep:tracing"]
+webpki = ["dep:webpki"]
+zlib = ["dep:zlib-rs"]
+
+[dependencies]
+brotli = { workspace = true, optional = true }
+brotli-decompressor = { workspace = true, optional = true }
+subtle = { workspace = true }
+tracing = { workspace = true, optional = true }
+webpki = { workspace = true, optional = true }
+pki-types = { workspace = true }
+zeroize = { workspace = true }
+zlib-rs = { workspace = true, optional = true }
 
 [dev-dependencies]
-env_logger = "0.8.2"
-log = "0.4.4"
-webpki-roots = "0.21"
-criterion = "0.3.0"
-rustls-pemfile = "0.2.0"
-base64 = "0.13.0"
+bencher = { workspace = true }
+graviola = { workspace = true }
+rcgen = { workspace = true }
+rustls-test = { workspace = true, default-features = false }
+time = { workspace = true }
+webpki-roots = { workspace = true }
 
 [[example]]
-name = "bogo_shim"
-path = "examples/internal/bogo_shim.rs"
-required-features = ["dangerous_configuration", "quic"]
-
-[[example]]
-name = "trytls_shim"
-path = "examples/internal/trytls_shim.rs"
-
-[[example]]
-name = "bench"
-path = "examples/internal/bench.rs"
-
-[[bench]]
-name = "benchmarks"
-path = "tests/benchmarks.rs"
-harness = false
+name = "test_ca"
+path = "examples/internal/test_ca.rs"
 
 [package.metadata.docs.rs]
-all-features = true
-rustdoc-args = ["--cfg", "docsrs"]
+# all non-default features except fips (cannot build on docs.rs environment)
+features = ["brotli", "std", "tracing", "zlib"]
+rustdoc-args = ["--cfg", "rustls_docsrs"]
+
+[package.metadata.cargo_check_external_types]
+allowed_external_types = [
+  # ---
+  "rustls_pki_types",
+  "rustls_pki_types::*",
+]
+
+[package.metadata.cargo-semver-checks.lints]
+enum_no_repr_variant_discriminant_changed = "warn"
+
+[lints]
+workspace = true

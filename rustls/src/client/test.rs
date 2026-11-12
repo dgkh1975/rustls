@@ -1,0 +1,1687 @@
+use alloc::borrow::Cow;
+use alloc::boxed::Box;
+use alloc::vec::Vec;
+use core::hash::Hasher;
+use core::sync::atomic::{AtomicBool, Ordering};
+use core::time::Duration;
+use std::sync::OnceLock;
+use std::vec;
+
+use pki_types::{CertificateDer, FipsStatus, ServerName, UnixTime};
+
+use super::handy::FailResolveClientCert;
+use super::{Tls12Session, Tls13ClientSessionInput, Tls13Session};
+use crate::client::{
+    ClientConfig, ClientCredentialResolver, ClientSessionKey, ClientSessionMemoryCache,
+    ClientSessionStore, CredentialRequest, Resumption, Tls12Resumption,
+};
+use crate::crypto::cipher::{EncodableVersion, Payload, Record, RecordEncrypter};
+use crate::crypto::kx::{self, NamedGroup, SharedSecret, StartedKeyExchange, SupportedKxGroup};
+use crate::crypto::test_provider::{FakeKeyExchangeGroup, KEY_EXCHANGE_GROUP, TLS_TEST_SUITE};
+use crate::crypto::tls13::OkmBlock;
+use crate::crypto::{
+    CipherSuite, Credentials, CryptoProvider, Identity, SelectedCredential, SignatureScheme,
+    SingleCredential, TEST_PROVIDER, TLS13_TEST_SUITE, tls12_only, tls13_only, tls13_suite,
+};
+use crate::enums::{ApplicationProtocol, CertificateType, HandshakeType, ProtocolVersion};
+use crate::error::{Error, PeerIncompatible, PeerMisbehaved};
+use crate::msgs::{
+    CertificateChain, ChangeCipherSpecPayload, ClientHelloPayload, Codec, Compression, ECCurveType,
+    EcParameters, EncryptedExtensions, ExtensionType, HandshakeMessagePayload, HandshakePayload,
+    HelloRetryRequest, HelloRetryRequestExtensions, KeyShareEntry, LengthPrefixedBuffer,
+    ListLength, MaybeEmpty, Message, MessagePayload, NewSessionTicketExtensions,
+    NewSessionTicketPayloadTls13, Random, Reader, ServerEcdhParams, ServerExtensions,
+    ServerHelloPayload, ServerKeyExchange, ServerKeyExchangeParams, ServerKeyExchangePayload,
+    SessionId, SingleProtocolName, SizedPayload,
+};
+use crate::pki_types::PrivateKeyDer;
+use crate::pki_types::pem::PemObject;
+use crate::suites::Suite;
+use crate::sync::Arc;
+use crate::time_provider::{DefaultTimeProvider, TimeProvider};
+use crate::tls13::Tls13ProtocolSuite;
+use crate::tls13::key_schedule::{derive_traffic_iv, derive_traffic_key};
+use crate::verify::{
+    HandshakeSignatureValid, ServerIdentity, ServerVerifier, SignatureVerificationInput,
+    VerifiedIdentity,
+};
+use crate::{
+    ClientSide, Connection, DigitallySignedStruct, DistinguishedName, KeyLog, RootCertStore, Tcp,
+    VecInput,
+};
+
+#[test]
+fn tls12_client_session_value_roundtrip() {
+    let session_id = SessionId::read(&mut Reader::new(&[
+        32, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07, 0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e,
+        0x0f, 0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17, 0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d,
+        0x1e, 0x1f, 0x20,
+    ]))
+    .unwrap();
+
+    let peer_identity =
+        VerifiedIdentity::assertion(Identity::X509(crate::crypto::CertificateIdentity {
+            end_entity: CertificateDer::from(&b"test cert"[..]),
+            intermediates: vec![],
+        }));
+
+    let session = Tls12Session::new(
+        TEST_PROVIDER.tls12_cipher_suites[0],
+        session_id,
+        Arc::new(SizedPayload::from(vec![0xde, 0xad, 0xbe, 0xef])),
+        &[0xab; 48],
+        peer_identity.clone(),
+        UnixTime::since_unix_epoch(Duration::from_secs(1234567890)),
+        Duration::from_secs(3600),
+        true, // extended_ms
+    );
+
+    let mut encoded = Vec::new();
+    session.encode(&mut encoded);
+    let decoded = Tls12Session::from_slice(&encoded, &TEST_PROVIDER).unwrap();
+
+    assert_eq!(decoded.suite.common.suite, session.suite.common.suite);
+    assert_eq!(decoded.session_id, session_id);
+    assert_eq!(&*decoded.master_secret, &*session.master_secret);
+    assert_eq!(decoded.extended_ms, session.extended_ms);
+    assert_eq!(decoded.common.ticket(), session.common.ticket());
+    assert_eq!(decoded.common.epoch, session.common.epoch);
+    assert_eq!(*decoded.common.peer_identity(), peer_identity.into());
+}
+
+#[test]
+fn tls13_client_session_value_roundtrip() {
+    let age_add = 0x12345678_u32;
+    let peer_identity = VerifiedIdentity::assertion(Identity::RawPublicKey(
+        pki_types::SubjectPublicKeyInfoDer::from(&b"raw public key"[..]),
+    ));
+
+    let session = Tls13Session::new(
+        &NewSessionTicketPayloadTls13 {
+            lifetime: Duration::from_secs(1800),
+            age_add,
+            nonce: SizedPayload::empty(),
+            ticket: Arc::new(SizedPayload::from(vec![0x11, 0x22, 0x33])),
+            extensions: NewSessionTicketExtensions {
+                max_early_data_size: Some(8192),
+            },
+        },
+        Tls13ClientSessionInput {
+            suite: Tls13ProtocolSuite::Tcp(TEST_PROVIDER.tls13_cipher_suites[0]),
+            peer_identity: peer_identity.clone(),
+            quic_params: Some(SizedPayload::<u16, MaybeEmpty>::from(vec![
+                0xaa, 0xbb, 0xcc, 0xdd,
+            ])),
+            alpn: Some(ApplicationProtocol::Http2),
+        },
+        &[0x55; 48],
+        UnixTime::since_unix_epoch(Duration::from_secs(9999999)),
+    );
+
+    let mut encoded = Vec::new();
+    session.encode(&mut encoded);
+    let decoded = Tls13Session::from_slice(&encoded, &TEST_PROVIDER).unwrap();
+
+    assert_eq!(
+        decoded.suite.suite().common.suite,
+        session.suite.suite().common.suite
+    );
+    assert_eq!(decoded.secret.bytes(), session.secret.bytes());
+    assert_eq!(decoded.age_add, age_add);
+    assert_eq!(decoded.max_early_data_size, session.max_early_data_size);
+    assert_eq!(decoded.quic_params.bytes(), session.quic_params.bytes());
+    assert_eq!(decoded.alpn, session.alpn);
+    assert_eq!(decoded.common.ticket(), session.common.ticket());
+    assert_eq!(decoded.common.epoch, session.common.epoch);
+    assert_eq!(*decoded.common.peer_identity(), peer_identity.into());
+}
+
+/// Tests that session_ticket(35) extension
+/// is not sent if the client does not support TLS 1.2.
+#[test]
+fn test_no_session_ticket_request_on_tls_1_3() {
+    let mut config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config.resumption =
+        Resumption::in_memory_sessions(128).tls12_resumption(Tls12Resumption::SessionIdOrTickets);
+    let ch = client_hello_sent_for_config(config).unwrap();
+    assert!(ch.extensions.session_ticket.is_none());
+}
+
+#[test]
+fn test_no_renegotiation_scsv_on_tls_1_3() {
+    let ch = client_hello_sent_for_config(
+        ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap(),
+    )
+    .unwrap();
+    assert!(
+        !ch.cipher_suites
+            .contains(&CipherSuite::TLS_EMPTY_RENEGOTIATION_INFO_SCSV)
+    );
+}
+
+#[test]
+fn test_client_does_not_offer_sha1() {
+    for provider in [
+        tls12_only(TEST_PROVIDER.clone()),
+        tls13_only(TEST_PROVIDER.clone()),
+    ] {
+        let config = ClientConfig::builder(Arc::new(provider))
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap();
+        let ch = client_hello_sent_for_config(config).unwrap();
+        assert!(
+            !ch.extensions
+                .signature_schemes
+                .as_ref()
+                .unwrap()
+                .contains(&SignatureScheme::RSA_PKCS1_SHA1),
+            "sha1 unexpectedly offered"
+        );
+    }
+}
+
+#[test]
+fn test_client_rejects_hrr_with_varied_session_id() {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server replies with HRR, but does not echo `session_id` as required.
+    let hrr = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: SessionId::empty(),
+                extensions: HelloRetryRequestExtensions {
+                    cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::IllegalHelloRetryRequestWithWrongSessionId.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_hrr_selecting_tls12_cipher_suite() {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server replies with HRR, but selects a TLS 1.2 cipher suite.
+    let hrr = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: TLS_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: HelloRetryRequestExtensions {
+                    cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::IllegalHelloRetryRequestWithUnofferedCipherSuite.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_hrr_with_cookie_and_offered_group() {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server replies with HRR carrying a cookie, but its key_share names the
+    // group the client already sent a share for.
+    let hrr = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: HelloRetryRequestExtensions {
+                    cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                    key_share: Some(KEY_EXCHANGE_GROUP.name()),
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::IllegalHelloRetryRequestWithOfferedGroup.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_server_hello_with_varied_session_id() {
+    let config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server replies with an otherwise-acceptable ServerHello, but does not
+    // echo `session_id` as required.
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: SessionId::empty(),
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry {
+                        group: KEY_EXCHANGE_GROUP.name(),
+                        payload: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::UnmatchedSessionId.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_server_hello_with_tls13_legacy_version() {
+    let config = ClientConfig::builder(Arc::new(tls13_only(TEST_PROVIDER.clone())))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server tries to select TLS1.3 with `legacy_version` instead of
+    // the `supported_versions` extension.
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_3,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry {
+                        group: KEY_EXCHANGE_GROUP.name(),
+                        payload: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::SelectedTls13UsingLegacyVersionField.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_hrr_with_wrong_legacy_version() {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // server replies with an otherwise-acceptable HRR whose `legacy_version`
+    // is not TLS1.2.
+    let hrr = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: CipherSuite::TLS13_AES_128_GCM_SHA256,
+                legacy_version: ProtocolVersion::TLSv1_3,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: HelloRetryRequestExtensions {
+                    cookie: Some(SizedPayload::from(vec![1, 2, 3, 4])),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::IllegalHelloRetryRequestWithWrongLegacyVersion.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_tls12_server_hello_echoing_compatibility_session_id() {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let store = Arc::new(ClientSessionMemoryCache::new(256));
+    let config = Arc::new(ClientConfig {
+        resumption: Resumption::store(store.clone()),
+        ..config
+    });
+
+    // a cached TLS 1.3 ticket is not a TLS 1.2 session, so the client still
+    // sends a compatibility `session_id` a TLS 1.2 server cannot know.
+    let server_name = ServerName::try_from("localhost").unwrap();
+    store.insert_tls13_ticket(
+        ClientSessionKey {
+            config_hash: config.config_hash(),
+            server_name: server_name.clone(),
+        },
+        Tls13Session::new(
+            &NewSessionTicketPayloadTls13::new(
+                Duration::from_secs(1800),
+                0x1234_5678,
+                [0u8; 32],
+                b"ticket".to_vec(),
+            ),
+            Tls13ClientSessionInput {
+                suite: Tls13ProtocolSuite::Tcp(TEST_PROVIDER.tls13_cipher_suites[0]),
+                peer_identity: VerifiedIdentity::assertion(Identity::RawPublicKey(
+                    pki_types::SubjectPublicKeyInfoDer::from(&b"spki"[..]),
+                )),
+                quic_params: None,
+                alpn: None,
+            },
+            &[0x55; 32],
+            UnixTime::now(),
+        ),
+    );
+
+    let mut tls = Vec::new();
+    let mut conn = config
+        .connect(server_name)
+        .build(&mut tls)
+        .unwrap();
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: Box::new(ServerExtensions {
+                    extended_main_secret_ack: Some(()),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::ServerEchoedCompatibilitySessionId.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_no_extended_main_secret_extension_when_require_ems_or_fips() {
+    let mut config = ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    if !matches!(config.provider().fips(), FipsStatus::Unvalidated) {
+        assert!(config.require_ems);
+    } else {
+        config.require_ems = true;
+    }
+
+    let config = Arc::new(config);
+    let mut tls = Vec::new();
+    let mut conn = config
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random::new(config.provider().secure_random).unwrap(),
+                compression_method: Compression::Null,
+                cipher_suite: CipherSuite(0xff12),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: SessionId::empty(),
+                extensions: Box::new(ServerExtensions::default()),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerIncompatible::ExtendedMainSecretExtensionRequired.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_non_empty_renegotiation_info_in_initial_handshake() {
+    let config = Arc::new(
+        ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap(),
+    );
+    let mut tls = Vec::new();
+    let mut conn = config
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // a TLS 1.2 server behaving as if it were renegotiating an existing
+    // connection: `renegotiated_connection` carries verify_data values
+    // instead of being empty.
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                legacy_version: ProtocolVersion::TLSv1_2,
+                random: Random::new(config.provider().secure_random).unwrap(),
+                session_id: SessionId::empty(),
+                cipher_suite: TLS_TEST_SUITE.common.suite,
+                compression_method: Compression::Null,
+                extensions: Box::new(ServerExtensions {
+                    extended_main_secret_ack: Some(()),
+                    renegotiation_info: Some(SizedPayload::from(vec![0x55; 24])),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::NonEmptyRenegotiationInfo.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_tls13_extension_in_tls12_server_hello() {
+    let config = Arc::new(
+        ClientConfig::builder(Arc::new(TEST_PROVIDER.clone()))
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap(),
+    );
+    let mut tls = Vec::new();
+    let mut conn = config
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // `key_share` was offered (TLS 1.3 is enabled), so it is not
+    // unsolicited, but it is only specified for TLS 1.3.
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                legacy_version: ProtocolVersion::TLSv1_2,
+                random: Random::new(config.provider().secure_random).unwrap(),
+                session_id: SessionId::empty(),
+                cipher_suite: TLS_TEST_SUITE.common.suite,
+                compression_method: Compression::Null,
+                extensions: Box::new(ServerExtensions {
+                    extended_main_secret_ack: Some(()),
+                    key_share: Some(KeyShareEntry::new(
+                        KEY_EXCHANGE_GROUP.name(),
+                        vec![0xaa; 32],
+                    )),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::UnsolicitedServerHelloExtension.into()
+    );
+}
+
+#[test]
+fn cas_extension_in_client_hello_if_server_verifier_requests_it() {
+    let cas_sending_server_verifier =
+        ServerVerifierWithAuthorityNames(Arc::from(vec![DistinguishedName::from(
+            b"hello".to_vec(),
+        )]));
+
+    let tls12_provider = tls12_only(TEST_PROVIDER.clone());
+    let tls13_provider = tls13_only(TEST_PROVIDER.clone());
+    for (provider, cas_extension_expected) in [(tls12_provider, false), (tls13_provider, true)] {
+        let client_hello = client_hello_sent_for_config(
+            ClientConfig::builder(provider.into())
+                .dangerous()
+                .with_custom_certificate_verifier(Arc::new(cas_sending_server_verifier.clone()))
+                .with_no_client_auth()
+                .unwrap(),
+        )
+        .unwrap();
+        assert_eq!(
+            client_hello
+                .extensions
+                .certificate_authority_names
+                .is_some(),
+            cas_extension_expected
+        );
+    }
+}
+
+/// Regression test for <https://github.com/seanmonstar/reqwest/issues/2191>
+#[test]
+fn test_client_with_custom_verifier_can_accept_ecdsa_sha1_signatures() {
+    let verifier = Arc::new(ExpectSha1EcdsaVerifier::default());
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER))
+        .dangerous()
+        .with_custom_certificate_verifier(verifier.clone())
+        .with_no_client_auth()
+        .unwrap();
+
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0u8; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: SessionId::empty(),
+                extensions: Box::new(ServerExtensions {
+                    extended_main_secret_ack: Some(()),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    let cert = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::Certificate(
+            CertificateChain(vec![CertificateDer::from(&b"does not matter"[..])]),
+        ))),
+    };
+    input
+        .read(&mut cert.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    let server_kx = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::ServerKeyExchange(ServerKeyExchangePayload::Known(
+                ServerKeyExchange {
+                    dss: DigitallySignedStruct::new(
+                        SignatureScheme::ECDSA_SHA1_Legacy,
+                        b"also does not matter".to_vec(),
+                    ),
+                    params: ServerKeyExchangeParams::Ecdh(ServerEcdhParams {
+                        curve_params: EcParameters {
+                            curve_type: ECCurveType::NamedCurve,
+                            named_group: KEY_EXCHANGE_GROUP.name(),
+                        },
+                        public: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                },
+            )),
+        )),
+    };
+    input
+        .read(&mut server_kx.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    let server_done = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::ServerHelloDone,
+        )),
+    };
+    input
+        .read(&mut server_done.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    assert!(
+        verifier
+            .seen_sha1_signature
+            .load(Ordering::SeqCst)
+    );
+}
+
+#[derive(Debug, Default)]
+struct ExpectSha1EcdsaVerifier {
+    seen_sha1_signature: AtomicBool,
+}
+
+impl ServerVerifier for ExpectSha1EcdsaVerifier {
+    fn verify_identity<'a>(
+        &self,
+        identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        Ok(VerifiedIdentity::assertion(identity.identity.clone()))
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        assert_eq!(input.signature.scheme, SignatureScheme::ECDSA_SHA1_Legacy);
+        self.seen_sha1_signature
+            .store(true, Ordering::SeqCst);
+        Ok(HandshakeSignatureValid::assertion())
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls13_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        todo!()
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        false
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::ECDSA_SHA1_Legacy]
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
+}
+
+#[test]
+fn config_hash_includes_concrete_type_of_each_component() {
+    fn config_hash(
+        time_provider: Arc<dyn TimeProvider>,
+        verifier: Arc<dyn ServerVerifier>,
+        resolver: Arc<dyn ClientCredentialResolver>,
+    ) -> [u8; 32] {
+        ClientConfig::builder_with_details(Arc::new(TEST_PROVIDER), time_provider)
+            .dangerous()
+            .with_custom_certificate_verifier(verifier)
+            .with_client_credential_resolver(resolver)
+            .unwrap()
+            .config_hash()
+    }
+
+    let base = || {
+        config_hash(
+            Arc::new(DefaultTimeProvider),
+            Arc::new(ServerVerifierRequiringRpk),
+            Arc::new(FailResolveClientCert {}),
+        )
+    };
+    assert_eq!(base(), base());
+
+    assert_ne!(
+        base(),
+        config_hash(
+            Arc::new(FixedTimeProvider),
+            Arc::new(ServerVerifierRequiringRpk),
+            Arc::new(FailResolveClientCert {}),
+        )
+    );
+    assert_ne!(
+        base(),
+        config_hash(
+            Arc::new(DefaultTimeProvider),
+            Arc::new(ExpectSha1EcdsaVerifier::default()),
+            Arc::new(FailResolveClientCert {}),
+        )
+    );
+    assert_ne!(
+        base(),
+        config_hash(
+            Arc::new(DefaultTimeProvider),
+            Arc::new(ServerVerifierRequiringRpk),
+            Arc::new(NoCredentialResolver),
+        )
+    );
+}
+
+#[derive(Debug)]
+struct FixedTimeProvider;
+
+impl TimeProvider for FixedTimeProvider {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(Duration::from_secs(1)))
+    }
+}
+
+#[derive(Debug)]
+struct NoCredentialResolver;
+
+impl ClientCredentialResolver for NoCredentialResolver {
+    fn resolve(&self, _: &CredentialRequest<'_>) -> Option<SelectedCredential> {
+        None
+    }
+
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[]
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
+}
+
+#[test]
+fn test_client_requiring_rpk_rejects_server_that_only_offers_x509_id_by_omission() {
+    client_requiring_rpk_receives_server_ee(
+        Err(PeerIncompatible::IncorrectCertificateTypeExtension.into()),
+        EncryptedExtensions::default(),
+        &TEST_PROVIDER,
+    );
+}
+
+#[test]
+fn test_client_requiring_rpk_rejects_server_that_only_offers_x509_id() {
+    client_requiring_rpk_receives_server_ee(
+        Err(PeerIncompatible::IncorrectCertificateTypeExtension.into()),
+        EncryptedExtensions {
+            server_certificate_type: Some(CertificateType::X509),
+            ..EncryptedExtensions::default()
+        },
+        &TEST_PROVIDER,
+    );
+}
+
+#[test]
+fn test_client_requiring_rpk_rejects_server_that_only_demands_x509_by_omission() {
+    client_requiring_rpk_receives_server_ee(
+        Err(PeerIncompatible::IncorrectCertificateTypeExtension.into()),
+        EncryptedExtensions {
+            server_certificate_type: Some(CertificateType::RawPublicKey),
+            ..EncryptedExtensions::default()
+        },
+        &TEST_PROVIDER,
+    );
+}
+
+#[test]
+fn test_client_requiring_rpk_rejects_server_that_only_demands_x509() {
+    client_requiring_rpk_receives_server_ee(
+        Err(PeerIncompatible::IncorrectCertificateTypeExtension.into()),
+        EncryptedExtensions {
+            client_certificate_type: Some(CertificateType::X509),
+            server_certificate_type: Some(CertificateType::RawPublicKey),
+            ..EncryptedExtensions::default()
+        },
+        &TEST_PROVIDER,
+    );
+}
+
+#[test]
+fn test_client_requiring_rpk_accepts_rpk_server() {
+    client_requiring_rpk_receives_server_ee(
+        Ok(()),
+        EncryptedExtensions {
+            client_certificate_type: Some(CertificateType::RawPublicKey),
+            server_certificate_type: Some(CertificateType::RawPublicKey),
+            ..EncryptedExtensions::default()
+        },
+        &TEST_PROVIDER,
+    );
+}
+
+#[track_caller]
+fn client_requiring_rpk_receives_server_ee(
+    expected: Result<(), Error>,
+    encrypted_extensions: EncryptedExtensions<'_>,
+    provider: &CryptoProvider,
+) {
+    let provider = Arc::new(CryptoProvider {
+        tls12_cipher_suites: Cow::default(),
+        ..provider.clone()
+    });
+
+    let fake_server_crypto = Arc::new(FakeServerCrypto::new(provider.clone()));
+    let credentials = client_credentials(&provider);
+    let mut config = ClientConfig::builder(provider)
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
+        .with_client_credential_resolver(Arc::new(SingleCredential::from(credentials)))
+        .unwrap();
+    config.key_log = fake_server_crypto.clone();
+
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry {
+                        group: KEY_EXCHANGE_GROUP.name(),
+                        payload: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    let ee = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::EncryptedExtensions(Box::new(encrypted_extensions)),
+        )),
+    };
+
+    let mut encrypter = fake_server_crypto.server_handshake_encrypter();
+    let ee = Record::<Payload<'_>>::from(ee);
+    let ee = ee.borrow_outbound();
+    let mut enc_ee = Vec::new();
+    encrypter
+        .encrypt(ee, 0, &mut enc_ee)
+        .unwrap();
+
+    input
+        .read(&mut enc_ee.as_slice())
+        .unwrap();
+
+    assert_eq!(process(&mut input, &mut conn), expected);
+}
+
+#[test]
+fn test_client_rejects_recognized_misplaced_extension_in_tls13_server_hello() {
+    // `supported_groups` and `signature_algorithms` are offered by the
+    // client, but not specified for the ServerHello.
+    for misplaced in [
+        ExtensionType::EllipticCurves,
+        ExtensionType::SignatureAlgorithms,
+    ] {
+        assert_eq!(
+            client_receives_tls13_server_hello_with_raw_extension(misplaced),
+            Err(PeerMisbehaved::UnexpectedCleartextExtension.into())
+        );
+    }
+
+    // Unrecognized extensions are rejected as unsolicited.
+    assert_eq!(
+        client_receives_tls13_server_hello_with_raw_extension(ExtensionType::from(0x04d2)),
+        Err(PeerMisbehaved::UnsolicitedServerHelloExtension.into())
+    );
+}
+
+fn client_receives_tls13_server_hello_with_raw_extension(
+    extension_type: ExtensionType,
+) -> Result<(), Error> {
+    let config = ClientConfig::builder(Arc::new(TEST_PROVIDER))
+        .dangerous()
+        .with_custom_certificate_verifier(Arc::new(ServerVerifierRequiringRpk))
+        .with_no_client_auth()
+        .unwrap();
+
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    // `ServerExtensions` cannot encode an extension type it does not model,
+    // so assemble the ServerHello body by hand and have
+    // `HandshakePayload::Unknown` carry it: the handshake and record headers
+    // are then computed by the usual encoding path.
+    let mut body = Vec::new();
+    ProtocolVersion::TLSv1_2.encode(&mut body);
+    Random([0; 32]).encode(&mut body);
+    SessionId::empty().encode(&mut body);
+    TEST_PROVIDER.tls13_cipher_suites[0]
+        .common
+        .suite
+        .encode(&mut body);
+    Compression::Null.encode(&mut body);
+
+    let extensions = LengthPrefixedBuffer::new(ListLength::U16, &mut body);
+    ExtensionType::SupportedVersions.encode(extensions.buf);
+    2u16.encode(extensions.buf);
+    ProtocolVersion::TLSv1_3.encode(extensions.buf);
+    ExtensionType::KeyShare.encode(extensions.buf);
+    let key_share = LengthPrefixedBuffer::new(ListLength::U16, extensions.buf);
+    KeyShareEntry::new(TEST_PROVIDER.kx_groups[0].name(), vec![0xaa; 32]).encode(key_share.buf);
+    drop(key_share);
+    extension_type.encode(extensions.buf);
+    0u16.encode(extensions.buf);
+    drop(extensions);
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::Unknown((
+            HandshakeType::ServerHello,
+            Payload::new(body),
+        )))),
+    };
+
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    conn.read_tls(&mut input, &mut tls)
+        .handle_all(&mut Vec::new())
+        .map(|_| ())
+}
+
+#[test]
+fn test_client_rejects_protected_change_cipher_spec() {
+    let provider = Arc::new(tls13_only(TEST_PROVIDER.clone()));
+    let fake_server_crypto = Arc::new(FakeServerCrypto::new(provider.clone()));
+    let mut config = ClientConfig::builder(provider)
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config.key_log = fake_server_crypto.clone();
+
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: client_hello_in(&tls).session_id,
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry {
+                        group: KEY_EXCHANGE_GROUP.name(),
+                        payload: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    // A change_cipher_spec protected under the handshake keys is not a
+    // compatibility-mode CCS, and must not be dropped like one.
+    let ccs = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::ChangeCipherSpec(ChangeCipherSpecPayload),
+    };
+
+    let mut encrypter = fake_server_crypto.server_handshake_encrypter();
+    let ccs = Record::<Payload<'_>>::from(ccs);
+    let ccs = ccs.borrow_outbound();
+    let mut enc_ccs = Vec::new();
+    encrypter
+        .encrypt(ccs, 0, &mut enc_ccs)
+        .unwrap();
+
+    input
+        .read(&mut enc_ccs.as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::IllegalMiddleboxChangeCipherSpec.into()
+    );
+}
+
+#[test]
+fn test_client_rejects_early_data_accepted_with_varied_alpn() {
+    assert_eq!(
+        client_receives_ee_accepting_early_data(Some(ApplicationProtocol::Http11)),
+        Err(PeerMisbehaved::EarlyDataAcceptedWithVariedApplicationProtocol.into())
+    );
+    assert_eq!(
+        client_receives_ee_accepting_early_data(None),
+        Err(PeerMisbehaved::EarlyDataAcceptedWithVariedApplicationProtocol.into())
+    );
+    assert_eq!(
+        client_receives_ee_accepting_early_data(Some(ApplicationProtocol::Http2)),
+        Ok(())
+    );
+}
+
+/// Resumes an h2 session with early data, offering h2 and http/1.1, and then
+/// receives a ServerHello selecting the PSK and EncryptedExtensions accepting
+/// early data with `selected_alpn`.
+fn client_receives_ee_accepting_early_data(
+    selected_alpn: Option<ApplicationProtocol<'static>>,
+) -> Result<(), Error> {
+    let provider = Arc::new(tls13_only(TEST_PROVIDER.clone()));
+    let fake_server_crypto = Arc::new(FakeServerCrypto::new(provider.clone()));
+    let store = Arc::new(ClientSessionMemoryCache::new(256));
+    let mut config = ClientConfig::builder(provider)
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    config.key_log = fake_server_crypto.clone();
+    config.enable_early_data = true;
+    config.resumption = Resumption::store(store.clone());
+    let config = Arc::new(config);
+
+    let server_name = ServerName::try_from("localhost").unwrap();
+    let mut ticket = NewSessionTicketPayloadTls13::new(
+        Duration::from_secs(1800),
+        0x1234_5678,
+        [0u8; 32],
+        b"ticket".to_vec(),
+    );
+    ticket.extensions.max_early_data_size = Some(1024);
+    store.insert_tls13_ticket(
+        ClientSessionKey {
+            config_hash: config.config_hash(),
+            server_name: server_name.clone(),
+        },
+        Tls13Session::new(
+            &ticket,
+            Tls13ClientSessionInput {
+                suite: Tls13ProtocolSuite::Tcp(TLS13_TEST_SUITE),
+                peer_identity: VerifiedIdentity::assertion(Identity::RawPublicKey(
+                    pki_types::SubjectPublicKeyInfoDer::from(&b"spki"[..]),
+                )),
+                quic_params: None,
+                alpn: Some(ApplicationProtocol::Http2),
+            },
+            &[0x55; 32],
+            UnixTime::now(),
+        ),
+    );
+
+    let mut tls = Vec::new();
+    let mut conn = config
+        .connect(server_name)
+        .with_alpn(vec![
+            ApplicationProtocol::Http2,
+            ApplicationProtocol::Http11,
+        ])
+        .build(&mut tls)
+        .unwrap();
+    let ch = client_hello_in(&tls);
+    assert!(ch.early_data_request.is_some());
+
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id: ch.session_id,
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry {
+                        group: KEY_EXCHANGE_GROUP.name(),
+                        payload: KEY_EXCHANGE_GROUP
+                            .start()
+                            .unwrap()
+                            .pub_key()
+                            .to_vec()
+                            .into(),
+                    }),
+                    preshared_key: Some(0),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    let ee = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::EncryptedExtensions(Box::new(EncryptedExtensions {
+                selected_protocol: selected_alpn.map(SingleProtocolName::new),
+                early_data_ack: Some(()),
+                ..EncryptedExtensions::default()
+            })),
+        )),
+    };
+
+    let mut encrypter = fake_server_crypto.server_handshake_encrypter();
+    let ee = Record::<Payload<'_>>::from(ee);
+    let ee = ee.borrow_outbound();
+    let mut enc_ee = Vec::new();
+    encrypter
+        .encrypt(ee, 0, &mut enc_ee)
+        .unwrap();
+
+    input
+        .read(&mut enc_ee.as_slice())
+        .unwrap();
+    process(&mut input, &mut conn)
+}
+
+fn client_credentials(provider: &CryptoProvider) -> Credentials {
+    let key = provider
+        .key_provider
+        .load_private_key(client_key())
+        .unwrap();
+    let identity = Arc::from(Identity::RawPublicKey(
+        key.public_key().unwrap().into_owned(),
+    ));
+    Credentials::new_unchecked(identity, key)
+}
+
+fn client_key() -> PrivateKeyDer<'static> {
+    PrivateKeyDer::from_pem_reader(
+        &mut include_bytes!("../../../test-ca/rsa-2048/client.key").as_slice(),
+    )
+    .unwrap()
+}
+
+#[derive(Clone, Debug)]
+struct ServerVerifierWithAuthorityNames(Arc<[DistinguishedName]>);
+
+impl ServerVerifier for ServerVerifierWithAuthorityNames {
+    fn root_hint_subjects(&self) -> Option<Arc<[DistinguishedName]>> {
+        Some(self.0.clone())
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_identity<'a>(
+        &self,
+        _identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        unreachable!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls12_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unreachable!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls13_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        unreachable!()
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::RSA_PKCS1_SHA1]
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        false
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
+}
+
+#[derive(Debug)]
+struct ServerVerifierRequiringRpk;
+
+impl ServerVerifier for ServerVerifierRequiringRpk {
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_identity<'a>(
+        &self,
+        _identity: &ServerIdentity<'a, '_>,
+    ) -> Result<VerifiedIdentity<'a>, Error> {
+        todo!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls12_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        todo!()
+    }
+
+    #[cfg_attr(coverage_nightly, coverage(off))]
+    fn verify_tls13_signature(
+        &self,
+        _input: &SignatureVerificationInput<'_>,
+    ) -> Result<HandshakeSignatureValid, Error> {
+        todo!()
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme> {
+        vec![SignatureScheme::RSA_PKCS1_SHA1]
+    }
+
+    fn request_ocsp_response(&self) -> bool {
+        false
+    }
+
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        &[CertificateType::RawPublicKey]
+    }
+
+    fn hash_config(&self, _: &mut dyn Hasher) {}
+}
+
+#[derive(Debug)]
+struct FakeServerCrypto {
+    server_handshake_secret: OnceLock<Vec<u8>>,
+    provider: Arc<CryptoProvider>,
+}
+
+impl FakeServerCrypto {
+    fn new(provider: Arc<CryptoProvider>) -> Self {
+        Self {
+            server_handshake_secret: OnceLock::new(),
+            provider,
+        }
+    }
+
+    fn server_handshake_encrypter(&self) -> Box<dyn RecordEncrypter> {
+        let secret = self
+            .server_handshake_secret
+            .get()
+            .unwrap();
+
+        let cipher_suite = tls13_suite(TLS13_TEST_SUITE.suite(), &self.provider);
+        let expander = cipher_suite
+            .hkdf_provider
+            .expander_for_okm(&OkmBlock::new(secret));
+
+        // Derive Encrypter
+        let key = derive_traffic_key(expander.as_ref(), cipher_suite.aead_alg);
+        let iv = derive_traffic_iv(expander.as_ref(), cipher_suite.aead_alg.iv_len());
+        cipher_suite.aead_alg.encrypter(key, iv)
+    }
+}
+
+impl KeyLog for FakeServerCrypto {
+    fn will_log(&self, _label: &str) -> bool {
+        true
+    }
+
+    fn log(&self, label: &str, _client_random: &[u8], secret: &[u8]) {
+        if label == "SERVER_HANDSHAKE_TRAFFIC_SECRET" {
+            self.server_handshake_secret
+                .set(secret.to_vec())
+                .unwrap();
+        }
+    }
+}
+
+// invalid with fips, as we can't offer X25519 separately
+#[test]
+fn hybrid_kx_component_share_offered_if_supported_separately() {
+    let ch = client_hello_sent_for_config(
+        ClientConfig::builder(Arc::new(HYBRID_PROVIDER.clone()))
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let key_shares = ch
+        .extensions
+        .key_shares
+        .as_ref()
+        .unwrap();
+    assert_eq!(key_shares.len(), 2);
+    assert_eq!(key_shares[0].group, NamedGroup(0xfe00));
+    assert_eq!(key_shares[1].group, NamedGroup(0xfe01));
+}
+
+#[test]
+fn hybrid_kx_component_share_not_offered_unless_supported_separately() {
+    let provider = CryptoProvider {
+        kx_groups: Cow::Owned(vec![FAKE_HYBRID as _]),
+        ..HYBRID_PROVIDER
+    };
+    let ch = client_hello_sent_for_config(
+        ClientConfig::builder(provider.into())
+            .with_root_certificates(roots())
+            .with_no_client_auth()
+            .unwrap(),
+    )
+    .unwrap();
+
+    let key_shares = ch
+        .extensions
+        .key_shares
+        .as_ref()
+        .unwrap();
+    assert_eq!(key_shares.len(), 1);
+    assert_eq!(key_shares[0].group, NamedGroup(0xfe00));
+}
+
+#[test]
+fn hybrid_kx_component_not_offered_after_hrr_but_server_chooses_it() {
+    // The hybrid group is not the first preference, so the initial hello
+    // carries only the classical group's share.
+    let provider = CryptoProvider {
+        kx_groups: Cow::Owned(vec![FAKE_KX_GROUP, FAKE_HYBRID as _]),
+        ..HYBRID_PROVIDER
+    };
+    let config = ClientConfig::builder(provider.into())
+        .with_root_certificates(roots())
+        .with_no_client_auth()
+        .unwrap();
+    let mut tls = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut tls)
+        .unwrap();
+    let session_id = client_hello_in(&tls).session_id;
+
+    // The server asks for the hybrid group, so the retry hello offers only
+    // that share, and not the component the initial hello would have added.
+    let hrr = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_3),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(
+            HandshakePayload::HelloRetryRequest(HelloRetryRequest {
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id,
+                extensions: HelloRetryRequestExtensions {
+                    key_share: Some(FAKE_HYBRID.name()),
+                    supported_versions: Some(ProtocolVersion::TLSv1_3),
+                    ..HelloRetryRequestExtensions::default()
+                },
+            }),
+        )),
+    };
+    let mut input = VecInput::default();
+    input
+        .read(&mut hrr.into_wire_bytes().as_slice())
+        .unwrap();
+    process(&mut input, &mut conn).unwrap();
+
+    // The server then selects the component group, which the retry hello
+    // did not offer.
+    let sh = Message {
+        version: EncodableVersion::Legacy(ProtocolVersion::TLSv1_2),
+        payload: MessagePayload::handshake(HandshakeMessagePayload(HandshakePayload::ServerHello(
+            ServerHelloPayload {
+                random: Random([0; 32]),
+                compression_method: Compression::Null,
+                cipher_suite: TLS13_TEST_SUITE.suite(),
+                legacy_version: ProtocolVersion::TLSv1_2,
+                session_id,
+                extensions: Box::new(ServerExtensions {
+                    key_share: Some(KeyShareEntry::new(
+                        FAKE_KX_GROUP.name(),
+                        KX_PEER_SHARE.to_vec(),
+                    )),
+                    selected_version: Some(ProtocolVersion::TLSv1_3),
+                    ..ServerExtensions::default()
+                }),
+            },
+        ))),
+    };
+    input
+        .read(&mut sh.into_wire_bytes().as_slice())
+        .unwrap();
+    assert_eq!(
+        process(&mut input, &mut conn).unwrap_err(),
+        PeerMisbehaved::WrongGroupForKeyShare.into()
+    );
+}
+
+fn client_hello_sent_for_config(config: ClientConfig) -> Result<ClientHelloPayload, Error> {
+    let mut bytes = Vec::new();
+    Arc::new(config)
+        .connect(ServerName::try_from("localhost").unwrap())
+        .build(&mut bytes)?;
+    Ok(client_hello_in(&bytes))
+}
+
+fn client_hello_in(flight: &[u8]) -> ClientHelloPayload {
+    let record = Record::<Payload<'_>>::read(&mut Reader::new(flight))
+        .unwrap()
+        .into_owned();
+    match Message::try_from(&record).unwrap() {
+        Message {
+            payload:
+                MessagePayload::Handshake {
+                    parsed: HandshakeMessagePayload(HandshakePayload::ClientHello(ch)),
+                    ..
+                },
+            ..
+        } => ch,
+        other => panic!("unexpected message {other:?}"),
+    }
+}
+
+const HYBRID_PROVIDER: CryptoProvider = CryptoProvider {
+    kx_groups: Cow::Borrowed(&[FAKE_HYBRID, FAKE_KX_GROUP]),
+    ..TEST_PROVIDER
+};
+
+const FAKE_HYBRID: &FakeHybrid = &FakeHybrid {
+    name: NamedGroup(0xfe00),
+    classical: NamedGroup(0xfe01),
+};
+const FAKE_KX_GROUP: &dyn SupportedKxGroup = &FakeKeyExchangeGroup(NamedGroup(0xfe01));
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct FakeHybrid {
+    name: NamedGroup,
+    classical: NamedGroup,
+}
+
+impl SupportedKxGroup for FakeHybrid {
+    fn start(&self) -> Result<StartedKeyExchange, Error> {
+        Ok(StartedKeyExchange::Hybrid(Box::new(*self)))
+    }
+
+    fn name(&self) -> NamedGroup {
+        self.name
+    }
+}
+
+impl kx::HybridKeyExchange for FakeHybrid {
+    fn component(&self) -> (NamedGroup, &[u8]) {
+        (self.classical, KX_PEER_SHARE)
+    }
+
+    fn complete_component(self: Box<Self>, peer_pub_key: &[u8]) -> Result<SharedSecret, Error> {
+        match peer_pub_key {
+            KX_PEER_SHARE => Ok(SharedSecret::from(KX_SHARED_SECRET)),
+            _ => Err(Error::from(PeerMisbehaved::InvalidKeyShare)),
+        }
+    }
+
+    fn as_key_exchange(&self) -> &(dyn kx::ActiveKeyExchange + 'static) {
+        FAKE_HYBRID
+    }
+
+    fn into_key_exchange(self: Box<Self>) -> Box<dyn kx::ActiveKeyExchange> {
+        self
+    }
+}
+
+impl kx::ActiveKeyExchange for FakeHybrid {
+    fn complete(self: Box<Self>, peer: &[u8]) -> Result<SharedSecret, Error> {
+        match peer {
+            KX_PEER_SHARE => Ok(SharedSecret::from(KX_SHARED_SECRET)),
+            _ => Err(Error::from(PeerMisbehaved::InvalidKeyShare)),
+        }
+    }
+
+    fn pub_key(&self) -> &[u8] {
+        KX_PEER_SHARE
+    }
+
+    fn group(&self) -> NamedGroup {
+        self.name
+    }
+}
+
+const KX_PEER_SHARE: &[u8] = b"KxPeerShareKxPeerShareKxPeerShare";
+const KX_SHARED_SECRET: &[u8] = b"KxSharedSecretKxSharedSecret";
+
+fn roots() -> RootCertStore {
+    let mut r = RootCertStore::empty();
+    r.add(CertificateDer::from_slice(include_bytes!(
+        "../../../test-ca/rsa-2048/ca.der"
+    )))
+    .unwrap();
+    r
+}
+
+fn process(input: &mut VecInput, conn: &mut Connection<ClientSide, Tcp>) -> Result<(), Error> {
+    conn.read_tls(input, &mut Vec::new())
+        .handle_all(&mut Vec::new())?;
+    Ok(())
+}

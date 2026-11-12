@@ -1,0 +1,1468 @@
+//! Assorted public API tests.
+
+#![allow(clippy::disallowed_types, clippy::duplicate_mod)]
+
+use core::hash::Hasher;
+use core::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
+use core::time::Duration;
+use std::fmt;
+use std::sync::Arc;
+
+use rustls::client::{
+    ClientCredentialResolver, CredentialRequest, Resumption, TicketRequest, Tls12Resumption,
+};
+use rustls::crypto::kx::NamedGroup;
+use rustls::crypto::{CertificateIdentity, Identity, SelectedCredential, TicketProducer};
+use rustls::enums::{CertificateType, ProtocolVersion};
+use rustls::error::{ApiMisuse, Error, PeerMisbehaved};
+use rustls::pki_types::UnixTime;
+use rustls::server::{ServerSessionKey, Tls13Tickets};
+use rustls::time_provider::TimeProvider;
+use rustls::{
+    ClientConfig, ClientSide, Connection, HandshakeKind, ServerConfig, ServerSide, Tcp, VecInput,
+};
+use rustls_test::{
+    ClientStorage, ClientStorageOp, ErrorFromPeer, HandshakeBuffers, KeyType, MultiTest,
+    ServerConfigExt, make_client_config, make_client_config_with_kx_groups, make_pair,
+    make_pair_for_arc_configs, make_pair_for_configs, make_server_config,
+    make_server_config_with_kx_groups, transfer, webpki_server_verifier_builder,
+};
+
+use super::provider;
+
+#[test]
+fn client_only_attempts_resumption_with_compatible_security() {
+    for (base_client_config, server_config, expect) in MultiTest::new(provider::DEFAULT_PROVIDER) {
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&base_client_config, &server_config);
+        buf.handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+        // base case
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&base_client_config, &server_config);
+        buf.handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+
+        // allowed case, using `clone`
+        let client_config = ClientConfig::clone(&base_client_config);
+        let (mut client, mut server, mut buf) =
+            make_pair_for_configs(client_config, ServerConfig::clone(&server_config));
+        buf.handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+
+        // disallowed case: unmatching `client_auth_cert_resolver`
+        let mut client_config = ClientConfig::builder(base_client_config.provider().clone())
+            .dangerous()
+            .with_custom_certificate_verifier(base_client_config.verifier().clone())
+            .with_client_credential_resolver(Arc::new(ForwardingResolver(
+                base_client_config.resolver().clone(),
+            )))
+            .unwrap();
+        client_config.resumption = base_client_config.resumption.clone();
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_configs(client_config, ServerConfig::clone(&server_config));
+        buf.handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+        // disallowed case: unmatching `verifier`
+        let mut client_config = ClientConfig::builder(base_client_config.provider().clone())
+            .dangerous()
+            .with_custom_certificate_verifier(Arc::new(
+                webpki_server_verifier_builder(
+                    expect.key_type.client_root_store(),
+                    base_client_config.provider(),
+                )
+                .allow_unknown_revocation_status()
+                .build()
+                .unwrap(),
+            ))
+            .with_client_credential_resolver(base_client_config.resolver().clone())
+            .unwrap();
+        client_config.resumption = base_client_config.resumption.clone();
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_configs(client_config, ServerConfig::clone(&server_config));
+        buf.handshake(&mut client, &mut server);
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    }
+}
+
+#[derive(Debug)]
+struct ForwardingResolver(Arc<dyn ClientCredentialResolver>);
+
+impl ClientCredentialResolver for ForwardingResolver {
+    fn resolve(&self, request: &CredentialRequest<'_>) -> Option<SelectedCredential> {
+        self.0.resolve(request)
+    }
+
+    fn supported_certificate_types(&self) -> &'static [CertificateType] {
+        self.0.supported_certificate_types()
+    }
+
+    fn hash_config(&self, h: &mut dyn Hasher) {
+        self.0.hash_config(h)
+    }
+}
+
+#[test]
+fn tls12_resumption_disabled() {
+    for (provider, second) in [
+        (provider::DEFAULT_TLS12_PROVIDER, HandshakeKind::Full),
+        (provider::DEFAULT_TLS13_PROVIDER, HandshakeKind::Resumed),
+    ] {
+        let mut client_config = make_client_config(KeyType::default(), &provider);
+        client_config.resumption =
+            Resumption::default().tls12_resumption(Tls12Resumption::Disabled);
+        let client_config = Arc::new(client_config);
+        let server_config = Arc::new(make_server_config(KeyType::default(), &provider));
+        for expected in [HandshakeKind::Full, second] {
+            let (mut client, mut server, mut buf) =
+                make_pair_for_arc_configs(&client_config, &server_config);
+            buf.handshake(&mut client, &mut server);
+            assert_eq!(client.handshake_kind(), Some(expected));
+            assert_eq!(server.handshake_kind(), Some(expected));
+        }
+    }
+}
+
+#[test]
+fn resumption_combinations() {
+    for (client_config, server_config, expect) in MultiTest::new(provider::DEFAULT_PROVIDER) {
+        let resumption_data = format!("resumption data {expect:?}");
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&client_config, &server_config);
+        assert_eq!(
+            server
+                .set_resumption_data(&[0u8; 0x8000])
+                .err(),
+            Some(ApiMisuse::ResumptionDataTooLarge.into())
+        );
+        server
+            .set_resumption_data(resumption_data.as_bytes())
+            .unwrap();
+        buf.handshake(&mut client, &mut server);
+
+        let expected_kx = expected_kx_for_version(expect.version);
+
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+        assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+        assert_eq!(
+            client
+                .negotiated_key_exchange_group()
+                .unwrap()
+                .name(),
+            expected_kx
+        );
+        assert_eq!(
+            server
+                .negotiated_key_exchange_group()
+                .unwrap()
+                .name(),
+            expected_kx
+        );
+
+        let (mut client, mut server, mut buf) =
+            make_pair_for_arc_configs(&client_config, &server_config);
+        buf.handshake(&mut client, &mut server);
+
+        assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+        assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+        assert_eq!(
+            server.side().received_resumption_data(),
+            Some(resumption_data.as_bytes())
+        );
+        if expect.version == ProtocolVersion::TLSv1_2 {
+            assert!(
+                client
+                    .negotiated_key_exchange_group()
+                    .is_none()
+            );
+            assert!(
+                server
+                    .negotiated_key_exchange_group()
+                    .is_none()
+            );
+        } else {
+            assert_eq!(
+                client
+                    .negotiated_key_exchange_group()
+                    .unwrap()
+                    .name(),
+                expected_kx
+            );
+            assert_eq!(
+                server
+                    .negotiated_key_exchange_group()
+                    .unwrap()
+                    .name(),
+                expected_kx
+            );
+        }
+    }
+}
+
+fn expected_kx_for_version(version: ProtocolVersion) -> NamedGroup {
+    match (
+        version,
+        super::provider_is_aws_lc_rs(),
+        super::provider_is_fips(),
+    ) {
+        (ProtocolVersion::TLSv1_3, true, _) => NamedGroup::X25519MLKEM768,
+        (_, _, true) => NamedGroup::secp256r1,
+        (_, _, _) => NamedGroup::X25519,
+    }
+}
+
+/// https://github.com/rustls/rustls/issues/797
+#[test]
+fn test_client_tls12_no_resume_after_server_downgrade() {
+    let provider = provider::DEFAULT_PROVIDER;
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    let client_storage = Arc::new(ClientStorage::new());
+    client_config.resumption = Resumption::store(client_storage.clone());
+    let client_config = Arc::new(client_config);
+
+    let server_config_1 = Arc::new(
+        ServerConfig::builder(provider::DEFAULT_TLS13_PROVIDER.into()).finish(KeyType::default()),
+    );
+
+    let mut server_config_2 =
+        ServerConfig::builder(provider::DEFAULT_TLS12_PROVIDER.into()).finish(KeyType::default());
+    server_config_2.session_storage = Arc::new(rustls::server::NoServerSessionStorage {});
+
+    let mut buf = HandshakeBuffers::default();
+
+    dbg!("handshake 1");
+    let mut client_1 = client_config
+        .connect("localhost".try_into().unwrap())
+        .build(&mut buf.client_output)
+        .unwrap();
+    let mut server_1 = Connection::new(server_config_1).unwrap();
+    buf.handshake(&mut client_1, &mut server_1);
+
+    assert_eq!(client_storage.ops().len(), 7);
+    println!("hs1 storage ops: {:#?}", client_storage.ops());
+    assert!(matches!(
+        client_storage.ops()[3],
+        ClientStorageOp::SetKxHint(_, _)
+    ));
+    assert!(matches!(
+        client_storage.ops()[4],
+        ClientStorageOp::RemoveTls12Session(_)
+    ));
+    assert!(matches!(
+        client_storage.ops()[5],
+        ClientStorageOp::InsertTls13Ticket(_)
+    ));
+
+    dbg!("handshake 2");
+    let mut client_2 = client_config
+        .connect("localhost".try_into().unwrap())
+        .build(&mut buf.client_output)
+        .unwrap();
+    let mut server_2 = Connection::new(Arc::new(server_config_2)).unwrap();
+    buf.handshake(&mut client_2, &mut server_2);
+    println!("hs2 storage ops: {:#?}", client_storage.ops());
+    assert_eq!(client_storage.ops().len(), 9);
+
+    // attempt consumes a TLS1.3 ticket
+    assert!(matches!(
+        client_storage.ops()[7],
+        ClientStorageOp::TakeTls13Ticket(_, true)
+    ));
+
+    // but ends up with TLS1.2
+    assert_eq!(client_2.protocol_version(), Some(ProtocolVersion::TLSv1_2));
+}
+
+#[test]
+fn test_tls13_client_resumption_does_not_reuse_tickets() {
+    let shared_storage = Arc::new(ClientStorage::new());
+    let provider = provider::DEFAULT_PROVIDER;
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    server_config.send_tls13_tickets = Tls13Tickets { default: 5, max: 5 };
+    let server_config = Arc::new(server_config);
+
+    // first handshake: client obtains 5 tickets from server.
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake_until_error(&mut client, &mut server)
+        .unwrap();
+
+    let ops = shared_storage.ops_and_reset();
+    println!("storage {ops:#?}");
+    assert_eq!(ops.len(), 10);
+    assert!(matches!(ops[5], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[6], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[7], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[8], ClientStorageOp::InsertTls13Ticket(_)));
+    assert!(matches!(ops[9], ClientStorageOp::InsertTls13Ticket(_)));
+
+    // 5 subsequent handshakes: all are resumptions
+
+    // Note: we don't do complete the handshakes, because that means
+    // we get five additional tickets per connection which is unhelpful
+    // in this test.  It also acts to record a "Happy Eyeballs"-type use
+    // case, where a client speculatively makes many connection attempts
+    // in parallel without knowledge of which will work due to underlying
+    // connectivity uncertainty.
+    for _ in 0..5 {
+        let mut server_output = Vec::new();
+        let (_client, mut server, mut buf) =
+            make_pair_for_arc_configs(&client_config, &server_config);
+        transfer(&mut buf.client_output, &mut buf.server_input);
+        server
+            .read_tls(&mut buf.server_input, &mut server_output)
+            .handle_all(&mut Vec::new())
+            .unwrap();
+
+        let ops = shared_storage.ops_and_reset();
+        assert!(matches!(ops[0], ClientStorageOp::TakeTls13Ticket(_, true)));
+    }
+
+    // 6th subsequent handshake: cannot be resumed; we ran out of tickets
+    let mut server_output = Vec::new();
+    let (_client, mut server, mut buf) = make_pair_for_arc_configs(&client_config, &server_config);
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    server
+        .read_tls(&mut buf.server_input, &mut server_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    let ops = shared_storage.ops_and_reset();
+    println!("last {ops:?}");
+    assert!(matches!(ops[0], ClientStorageOp::TakeTls13Ticket(_, false)));
+}
+
+#[test]
+fn tls13_stateful_resumption() {
+    let kt = KeyType::default();
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let client_config = make_client_config(kt, &provider);
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(kt, &provider);
+    let storage = Arc::new(ServerStorage::new());
+    server_config.session_storage = storage.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (full_c2s, full_s2c) = buf.handshake(&mut client, &mut server);
+    assert_eq!(client.tls13_tickets_received(), 2);
+    assert_eq!(storage.puts(), 2);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 0);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+
+    // resumed
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (resume_c2s, resume_s2c) = buf.handshake(&mut client, &mut server);
+    assert!(resume_c2s > full_c2s);
+    assert!(resume_s2c < full_s2c);
+    assert_eq!(storage.puts(), 4);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 1);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+
+    // resumed again
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (resume2_c2s, resume2_s2c) = buf.handshake(&mut client, &mut server);
+    assert_eq!(resume_s2c, resume2_s2c);
+    assert_eq!(resume_c2s, resume2_c2s);
+    assert_eq!(storage.puts(), 6);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 2);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+}
+
+#[test]
+fn tls13_stateless_resumption() {
+    let kt = KeyType::default();
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let client_config = make_client_config(kt, &provider);
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.ticketer = Some(
+        provider
+            .ticketer_factory
+            .ticketer()
+            .unwrap(),
+    );
+    let storage = Arc::new(ServerStorage::new());
+    server_config.session_storage = storage.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (full_c2s, full_s2c) = buf.handshake(&mut client, &mut server);
+    assert_eq!(storage.puts(), 0);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 0);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+
+    // resumed
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (resume_c2s, resume_s2c) = buf.handshake(&mut client, &mut server);
+    assert!(resume_c2s > full_c2s);
+    assert!(resume_s2c < full_s2c);
+    assert_eq!(storage.puts(), 0);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 0);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+
+    // resumed again
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    let (resume2_c2s, resume2_s2c) = buf.handshake(&mut client, &mut server);
+    assert_eq!(resume_s2c, resume2_s2c);
+    assert_eq!(resume_c2s, resume2_c2s);
+    assert_eq!(storage.puts(), 0);
+    assert_eq!(storage.gets(), 0);
+    assert_eq!(storage.takes(), 0);
+    assert_eq!(
+        client
+            .peer_identity()
+            .map(|identity| match identity.identity() {
+                Identity::X509(CertificateIdentity { intermediates, .. }) => intermediates.len(),
+                _ => 0,
+            }),
+        Some(2)
+    );
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+}
+
+#[test]
+fn early_data_not_available() {
+    let (mut client, _, _) = make_pair(KeyType::default(), &provider::DEFAULT_PROVIDER);
+    assert!(client.early_data().is_none());
+}
+
+fn early_data_configs() -> (Arc<ClientConfig>, Arc<ServerConfig>) {
+    let kt = KeyType::default();
+    let provider = provider::DEFAULT_PROVIDER;
+    let mut client_config = make_client_config(kt, &provider);
+    client_config.enable_early_data = true;
+    client_config.resumption = Resumption::store(Arc::new(ClientStorage::new()));
+
+    let mut server_config = make_server_config(kt, &provider);
+    server_config.max_early_data_size = 1234;
+    (Arc::new(client_config), Arc::new(server_config))
+}
+
+/// Completes a full handshake so a session is cached, then returns a fresh pair that will resume it.
+fn resumable_pair(
+    client_config: &Arc<ClientConfig>,
+    server_config: &Arc<ServerConfig>,
+) -> (
+    Connection<ClientSide, Tcp>,
+    Connection<ServerSide, Tcp>,
+    HandshakeBuffers,
+) {
+    let (mut client, mut server, mut warmup_io) =
+        make_pair_for_arc_configs(client_config, server_config);
+    warmup_io.handshake(&mut client, &mut server);
+
+    make_pair_for_arc_configs(client_config, server_config)
+}
+
+/// Processes all input on `server`, returning the received early data and traffic data separately.
+fn server_read(
+    server: &mut Connection<ServerSide, Tcp>,
+    input: &mut VecInput,
+    output: &mut Vec<u8>,
+) -> (Vec<u8>, Vec<u8>) {
+    let mut handler = server.read_tls(input, output);
+    let mut early = Vec::new();
+    while let Some(result) = handler.next_early_data() {
+        early.extend_from_slice(result.unwrap().bytes());
+    }
+
+    let mut traffic = Vec::new();
+    handler
+        .handle_all(&mut traffic)
+        .unwrap();
+    (early, traffic)
+}
+
+/// Length of the first TLS record in `tls`, including its header.
+fn first_record_len(tls: &[u8]) -> usize {
+    5 + usize::from(u16::from_be_bytes([tls[3], tls[4]]))
+}
+
+#[test]
+fn early_data_is_available_on_resumption() {
+    let (client_config, server_config) = early_data_configs();
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        1234
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(b"".into(), &mut buf.client_output)
+            .unwrap(),
+        0
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(b"hello".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+    let client_early_exporter = client.early_exporter().unwrap();
+    assert_eq!(
+        client.early_exporter().err(),
+        Some(Error::ApiMisuse(ApiMisuse::ExporterNotAvailable)),
+    );
+    let mut received_early_data = Vec::new();
+    buf.handshake_collecting_early_data(&mut client, &mut server, &mut received_early_data);
+
+    assert_eq!(&received_early_data[..], b"hello");
+    let server_early_exporter = server.early_exporter().unwrap();
+    assert_eq!(
+        server.early_exporter().err(),
+        Some(Error::ApiMisuse(ApiMisuse::ExporterNotAvailable)),
+    );
+
+    // check exporters agree
+    let client_secret = client_early_exporter
+        .derive(b"label", Some(b"context"), [0u8; 32])
+        .unwrap();
+    let server_secret = server_early_exporter
+        .derive(b"label", Some(b"context"), [0u8; 32])
+        .unwrap();
+    assert_eq!(client_secret, server_secret);
+}
+
+#[test]
+fn early_data_not_available_on_server_before_client_hello() {
+    let mut server = Connection::new(Arc::new(make_server_config(
+        KeyType::default(),
+        &provider::DEFAULT_PROVIDER,
+    )))
+    .unwrap();
+    assert!(
+        server
+            .read_tls(&mut VecInput::default(), &mut Vec::new())
+            .next_early_data()
+            .is_none()
+    );
+    assert_eq!(
+        server.early_exporter().unwrap_err(),
+        ApiMisuse::ExporterNotAvailable.into(),
+    );
+}
+
+#[test]
+fn early_data_is_limited_on_client() {
+    let (client_config, server_config) = early_data_configs();
+
+    // warm up
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        1234
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xaa; 1234 + 1]).into(), &mut buf.client_output)
+            .unwrap(),
+        1234
+    );
+    let mut received_early_data = Vec::new();
+    buf.handshake_collecting_early_data(&mut client, &mut server, &mut received_early_data);
+
+    assert_eq!(&received_early_data[..], [0xaa; 1234]);
+}
+
+fn early_data_configs_allowing_client_to_send_excess_data() -> (Arc<ClientConfig>, Arc<ServerConfig>)
+{
+    let (client_config, server_config) = early_data_configs();
+
+    // adjust client session storage to corrupt received max_early_data_size
+    let mut client_config = Arc::into_inner(client_config).unwrap();
+    let mut storage = ClientStorage::new();
+    storage.alter_max_early_data_size(1234, 2024);
+    client_config.resumption = Resumption::store(Arc::new(storage));
+    let client_config = Arc::new(client_config);
+
+    // warm up
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    (client_config, server_config)
+}
+
+#[test]
+fn server_detects_excess_early_data() {
+    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        2024
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xaa; 2024]).into(), &mut buf.client_output)
+            .unwrap(),
+        2024
+    );
+    assert_eq!(
+        buf.handshake_until_error(&mut client, &mut server),
+        Err(ErrorFromPeer::Server(Error::PeerMisbehaved(
+            PeerMisbehaved::TooMuchEarlyDataReceived
+        ))),
+    );
+}
+
+// regression test for https://github.com/rustls/rustls/issues/2096
+#[test]
+fn server_detects_excess_streamed_early_data() {
+    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+    let mut server_input = VecInput::default();
+
+    let mut server_output = Vec::new();
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_some());
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .bytes_left(),
+        2024
+    );
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xaa; 1024]).into(), &mut buf.client_output)
+            .unwrap(),
+        1024
+    );
+    transfer(&mut buf.client_output, &mut server_input);
+    let mut handler = server.read_tls(&mut server_input, &mut server_output);
+    let mut received_early_data = Vec::new();
+    while let Some(result) = handler.next_early_data() {
+        received_early_data.extend_from_slice(result.unwrap().bytes());
+    }
+    handler
+        .handle_all(&mut Vec::new())
+        .unwrap();
+
+    assert_eq!(&received_early_data[..], [0xaa; 1024]);
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xbb; 1000]).into(), &mut buf.client_output)
+            .unwrap(),
+        1000
+    );
+    transfer(&mut buf.client_output, &mut server_input);
+    assert_eq!(
+        server
+            .read_tls(&mut server_input, &mut server_output)
+            .handle_all(&mut Vec::new())
+            .unwrap_err(),
+        Error::PeerMisbehaved(PeerMisbehaved::TooMuchEarlyDataReceived)
+    );
+}
+
+#[test]
+fn early_data_and_traffic_are_kept_separate() {
+    let (client_config, server_config) = early_data_configs();
+    let (mut client, mut server, mut buf) = resumable_pair(&client_config, &server_config);
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+    let mut server_output = Vec::new();
+
+    // Two writes produce two early data records.
+    let mut early = client.early_data().unwrap();
+    assert_eq!(
+        early
+            .write(b"hello ".into(), &mut buf.client_output)
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        early
+            .write(b"early".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+
+    // Deliver only the ClientHello for now, holding the early data records back.
+    let mut held_back = buf
+        .client_output
+        .split_off(first_record_len(&buf.client_output));
+    transfer(&mut buf.client_output, &mut server_input);
+    assert_eq!(
+        server_read(&mut server, &mut server_input, &mut server_output),
+        (Vec::new(), Vec::new())
+    );
+    assert!(server.is_handshaking());
+
+    // The client finishes its handshake and immediately sends traffic data.
+    transfer(&mut server_output, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    assert!(!client.is_handshaking());
+    assert!(client.side().is_early_data_accepted());
+    client
+        .write(b"normal".into(), &mut buf.client_output)
+        .unwrap();
+
+    // The server now receives early data, EndOfEarlyData, Finished and traffic data in one go.
+    held_back.append(&mut buf.client_output);
+    transfer(&mut held_back, &mut server_input);
+    let mut handler = server.read_tls(&mut server_input, &mut server_output);
+    assert_eq!(
+        handler
+            .next_early_data()
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        b"hello "
+    );
+    assert_eq!(
+        handler
+            .next_early_data()
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        b"early"
+    );
+    // Traffic data must not be yielded as early data, and asking again is harmless.
+    assert!(handler.next_early_data().is_none());
+    assert!(handler.next_early_data().is_none());
+    let mut traffic = Vec::new();
+    handler
+        .handle_all(&mut traffic)
+        .unwrap();
+    assert_eq!(traffic, b"normal");
+    assert!(!server.is_handshaking());
+
+    // After the handshake, early data is never yielded but traffic still flows.
+    client
+        .write(b"more".into(), &mut buf.client_output)
+        .unwrap();
+    transfer(&mut buf.client_output, &mut server_input);
+    assert_eq!(
+        server_read(&mut server, &mut server_input, &mut server_output),
+        (Vec::new(), b"more".to_vec())
+    );
+
+    // The early exporter remains available after the early data phase.
+    server.early_exporter().unwrap();
+}
+
+#[test]
+fn unread_early_data_is_dropped() {
+    let (client_config, server_config) = early_data_configs();
+    let (mut client, mut server, mut buf) = resumable_pair(&client_config, &server_config);
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+    let mut server_output = Vec::new();
+
+    let mut early = client.early_data().unwrap();
+    assert_eq!(
+        early
+            .write(b"hello ".into(), &mut buf.client_output)
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        early
+            .write(b"early".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+
+    // Skipping `next_early_data()` drops the early data without error.
+    transfer(&mut buf.client_output, &mut server_input);
+    let mut traffic = Vec::new();
+    server
+        .read_tls(&mut server_input, &mut server_output)
+        .handle_all(&mut traffic)
+        .unwrap();
+    assert!(traffic.is_empty());
+
+    transfer(&mut server_output, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    assert!(client.side().is_early_data_accepted());
+    client
+        .write(b"normal".into(), &mut buf.client_output)
+        .unwrap();
+
+    // The dropped early data is gone for good; only traffic data is yielded.
+    transfer(&mut buf.client_output, &mut server_input);
+    let mut handler = server.read_tls(&mut server_input, &mut server_output);
+    assert!(handler.next_early_data().is_none());
+    assert_eq!(
+        handler
+            .next_payload()
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        b"normal"
+    );
+    let mut rest = Vec::new();
+    handler.handle_all(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    assert!(!server.is_handshaking());
+}
+
+#[test]
+fn early_data_is_dropped_by_next_payload() {
+    let (client_config, server_config) = early_data_configs();
+    let (mut client, mut server, mut buf) = resumable_pair(&client_config, &server_config);
+    let mut client_input = VecInput::default();
+    let mut server_input = VecInput::default();
+    let mut server_output = Vec::new();
+
+    let mut early = client.early_data().unwrap();
+    assert_eq!(
+        early
+            .write(b"hello ".into(), &mut buf.client_output)
+            .unwrap(),
+        6
+    );
+    assert_eq!(
+        early
+            .write(b"early".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+
+    // Deliver only the ClientHello, then complete the client's side of the handshake.
+    let mut held_back = buf
+        .client_output
+        .split_off(first_record_len(&buf.client_output));
+    transfer(&mut buf.client_output, &mut server_input);
+    server
+        .read_tls(&mut server_input, &mut server_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    transfer(&mut server_output, &mut client_input);
+    client
+        .read_tls(&mut client_input, &mut buf.client_output)
+        .handle_all(&mut Vec::new())
+        .unwrap();
+    client
+        .write(b"normal".into(), &mut buf.client_output)
+        .unwrap();
+
+    // Early data records, EndOfEarlyData, Finished and traffic data arrive together;
+    // `next_payload()` skips the early data and yields only the traffic data.
+    held_back.append(&mut buf.client_output);
+    transfer(&mut held_back, &mut server_input);
+    let mut handler = server.read_tls(&mut server_input, &mut server_output);
+    assert_eq!(
+        handler
+            .next_payload()
+            .unwrap()
+            .unwrap()
+            .bytes(),
+        b"normal"
+    );
+    assert!(handler.next_early_data().is_none());
+    let mut rest = Vec::new();
+    handler.handle_all(&mut rest).unwrap();
+    assert!(rest.is_empty());
+    assert!(!server.is_handshaking());
+}
+
+#[test]
+fn next_early_data_yields_nothing_without_early_data() {
+    let (client_config, server_config) = early_data_configs();
+
+    // A full (non-resumed) handshake never carries early data.
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    assert!(client.early_data().is_none());
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    assert_eq!(
+        server_read(&mut server, &mut buf.server_input, &mut buf.server_output),
+        (Vec::new(), Vec::new())
+    );
+    let mut received_early_data = Vec::new();
+    buf.handshake_collecting_early_data(&mut client, &mut server, &mut received_early_data);
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+    assert!(received_early_data.is_empty());
+
+    client
+        .write(b"normal".into(), &mut buf.client_output)
+        .unwrap();
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    assert_eq!(
+        server_read(&mut server, &mut buf.server_input, &mut buf.server_output),
+        (Vec::new(), b"normal".to_vec())
+    );
+}
+
+#[test]
+fn rejected_early_data_is_skipped() {
+    let (client_config, server_config) = early_data_configs();
+
+    // Resume against a server that shares the session cache but no longer allows early data.
+    let mut rejecting_config = (*server_config).clone();
+    rejecting_config.max_early_data_size = 0;
+    let (mut client, _, mut buf) = resumable_pair(&client_config, &server_config);
+    let mut server = Connection::new(Arc::new(rejecting_config)).unwrap();
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write(b"early".into(), &mut buf.client_output)
+            .unwrap(),
+        5
+    );
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    assert_eq!(
+        server_read(&mut server, &mut buf.server_input, &mut buf.server_output),
+        (Vec::new(), Vec::new())
+    );
+
+    let mut received_early_data = Vec::new();
+    buf.handshake_collecting_early_data(&mut client, &mut server, &mut received_early_data);
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Resumed));
+    assert!(!client.side().is_early_data_accepted());
+    assert!(client.early_data().is_none());
+    assert!(received_early_data.is_empty());
+
+    client
+        .write(b"normal".into(), &mut buf.client_output)
+        .unwrap();
+    transfer(&mut buf.client_output, &mut buf.server_input);
+    assert_eq!(
+        server_read(&mut server, &mut buf.server_input, &mut buf.server_output),
+        (Vec::new(), b"normal".to_vec())
+    );
+}
+
+#[test]
+fn next_early_data_reports_excess_early_data() {
+    let (client_config, server_config) = early_data_configs_allowing_client_to_send_excess_data();
+    let mut server_input = VecInput::default();
+    let mut server_output = Vec::new();
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xaa; 1024]).into(), &mut buf.client_output)
+            .unwrap(),
+        1024
+    );
+    transfer(&mut buf.client_output, &mut server_input);
+    assert_eq!(
+        server_read(&mut server, &mut server_input, &mut server_output),
+        ([0xaa; 1024].to_vec(), Vec::new())
+    );
+
+    assert_eq!(
+        client
+            .early_data()
+            .unwrap()
+            .write((&[0xbb; 1000]).into(), &mut buf.client_output)
+            .unwrap(),
+        1000
+    );
+    transfer(&mut buf.client_output, &mut server_input);
+    let mut handler = server.read_tls(&mut server_input, &mut server_output);
+    assert_eq!(
+        handler
+            .next_early_data()
+            .unwrap()
+            .unwrap_err(),
+        Error::PeerMisbehaved(PeerMisbehaved::TooMuchEarlyDataReceived)
+    );
+    // The same error is reported when driving the handler to completion.
+    assert_eq!(
+        handler
+            .handle_all(&mut Vec::new())
+            .unwrap_err(),
+        Error::PeerMisbehaved(PeerMisbehaved::TooMuchEarlyDataReceived)
+    );
+}
+
+struct ServerStorage {
+    storage: Arc<dyn rustls::server::StoresServerSessions>,
+    put_count: AtomicUsize,
+    get_count: AtomicUsize,
+    take_count: AtomicUsize,
+}
+
+impl ServerStorage {
+    fn new() -> Self {
+        Self {
+            storage: rustls::server::ServerSessionMemoryCache::new(1024),
+            put_count: AtomicUsize::new(0),
+            get_count: AtomicUsize::new(0),
+            take_count: AtomicUsize::new(0),
+        }
+    }
+
+    fn puts(&self) -> usize {
+        self.put_count.load(Ordering::SeqCst)
+    }
+    fn gets(&self) -> usize {
+        self.get_count.load(Ordering::SeqCst)
+    }
+    fn takes(&self) -> usize {
+        self.take_count.load(Ordering::SeqCst)
+    }
+}
+
+impl fmt::Debug for ServerStorage {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "(put: {:?}, get: {:?}, take: {:?})",
+            self.put_count, self.get_count, self.take_count
+        )
+    }
+}
+
+impl rustls::server::StoresServerSessions for ServerStorage {
+    fn put(&self, key: ServerSessionKey<'_>, value: Vec<u8>) -> bool {
+        self.put_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.storage.put(key, value)
+    }
+
+    fn get(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+        self.get_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.storage.get(key)
+    }
+
+    fn take(&self, key: ServerSessionKey<'_>) -> Option<Vec<u8>> {
+        self.take_count
+            .fetch_add(1, Ordering::SeqCst);
+        self.storage.take(key)
+    }
+
+    fn can_cache(&self) -> bool {
+        true
+    }
+}
+
+#[test]
+fn tls13_ticket_request_new_vs_resumed() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 3,
+        resumption_count: 1,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    // default is 2, but the client may request up to 5
+    server_config.send_tls13_tickets = Tls13Tickets { default: 2, max: 5 };
+    let server_config = Arc::new(server_config);
+
+    // new connection: client requests 3 (above the default of 2, below the max of 5)
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 3);
+
+    // resumed connection: server sends resumption_count (1)
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Resumed));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 1);
+}
+
+#[test]
+fn tls13_ticket_request_zero_means_no_tickets() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 0,
+        resumption_count: 0,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    // server would send 5 by default, but the client requests 0
+    server_config.send_tls13_tickets = Tls13Tickets { default: 5, max: 5 };
+    let server_config = Arc::new(server_config);
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 0);
+}
+
+#[test]
+fn tls13_ticket_request_capped_by_server() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 10,
+        resumption_count: 10,
+    });
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    // client requests 10, but the server's max is 3
+    server_config.send_tls13_tickets = Tls13Tickets { default: 2, max: 3 };
+    let server_config = Arc::new(server_config);
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 3);
+}
+
+#[test]
+fn tls13_ticket_request_not_sent_when_none() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = None;
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    server_config.send_tls13_tickets = Tls13Tickets { default: 4, max: 8 };
+    let server_config = Arc::new(server_config);
+
+    // without the extension, server uses its default (4), not the max (8)
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 4);
+}
+
+#[test]
+fn tls13_ticket_request_survives_hello_retry_request() {
+    let provider = provider::DEFAULT_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    // client offers secp384r1 first, server only accepts x25519 -> triggers HRR
+    let mut client_config = make_client_config_with_kx_groups(
+        KeyType::default(),
+        vec![provider::kx_group::SECP384R1, provider::kx_group::X25519],
+        &provider,
+    );
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    client_config.send_ticket_request = Some(TicketRequest {
+        new_session_count: 2,
+        resumption_count: 1,
+    });
+    let client_config = Arc::new(client_config);
+
+    let server_config = Arc::new(make_server_config_with_kx_groups(
+        KeyType::default(),
+        vec![provider::kx_group::X25519],
+        &provider,
+    ));
+
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(
+        client.handshake_kind(),
+        Some(HandshakeKind::FullWithHelloRetryRequest)
+    );
+
+    let ops = shared_storage.ops_and_reset();
+    let ticket_inserts = ops
+        .iter()
+        .filter(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+        .count();
+    assert_eq!(ticket_inserts, 2);
+}
+
+#[test]
+fn tls13_client_discards_zero_lifetime_ticket() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let shared_storage = Arc::new(ClientStorage::new());
+
+    let mut client_config = make_client_config(KeyType::default(), &provider);
+    client_config.resumption = Resumption::store(shared_storage.clone());
+    let client_config = Arc::new(client_config);
+
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    server_config.ticketer = Some(Arc::new(ZeroLifetimeTicketer(
+        provider
+            .ticketer_factory
+            .ticketer()
+            .unwrap(),
+    )));
+    let server_config = Arc::new(server_config);
+
+    // full handshake: every ticket the server sends has a zero lifetime
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert!(
+        !shared_storage
+            .ops_and_reset()
+            .iter()
+            .any(|op| matches!(op, ClientStorageOp::InsertTls13Ticket(_)))
+    );
+
+    // nothing was stored, so the next connection cannot resume
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+}
+
+#[test]
+fn tls13_server_rejects_expired_stateful_session() {
+    let provider = provider::DEFAULT_TLS13_PROVIDER;
+    let client_config = Arc::new(make_client_config(KeyType::default(), &provider));
+
+    let clock = Arc::new(AdjustableClock::new());
+    let storage = Arc::new(ServerStorage::new());
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    server_config.session_storage = storage.clone();
+    server_config.time_provider = clock.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake: the server stores the sessions and advertises a 24 hour lifetime
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(storage.puts(), 2);
+
+    // 25 hours later (by the server's clock) the stored session is found but not resumed
+    clock.advance(Duration::from_secs(25 * 60 * 60));
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(storage.takes(), 1);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+}
+
+#[test]
+fn tls12_server_rejects_expired_stateful_session() {
+    let provider = provider::DEFAULT_TLS12_PROVIDER;
+    let client_config = Arc::new(make_client_config(KeyType::default(), &provider));
+
+    let clock = Arc::new(AdjustableClock::new());
+    let storage = Arc::new(ServerStorage::new());
+    let mut server_config = make_server_config(KeyType::default(), &provider);
+    server_config.session_storage = storage.clone();
+    server_config.time_provider = clock.clone();
+    let server_config = Arc::new(server_config);
+
+    // full handshake: the server stores the session under its session id
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(storage.puts(), 1);
+
+    // 25 hours later (by the server's clock) the stored session is found but not resumed
+    clock.advance(Duration::from_secs(25 * 60 * 60));
+    let (mut client, mut server, mut buf) =
+        make_pair_for_arc_configs(&client_config, &server_config);
+    buf.handshake(&mut client, &mut server);
+    assert_eq!(storage.gets(), 1);
+    assert_eq!(client.handshake_kind(), Some(HandshakeKind::Full));
+    assert_eq!(server.handshake_kind(), Some(HandshakeKind::Full));
+}
+
+/// A `TimeProvider` that starts at the current time and only moves when told to.
+#[derive(Debug)]
+struct AdjustableClock(AtomicU64);
+
+impl AdjustableClock {
+    fn new() -> Self {
+        Self(AtomicU64::new(UnixTime::now().as_secs()))
+    }
+
+    fn advance(&self, by: Duration) {
+        self.0
+            .fetch_add(by.as_secs(), Ordering::SeqCst);
+    }
+}
+
+impl TimeProvider for AdjustableClock {
+    fn current_time(&self) -> Option<UnixTime> {
+        Some(UnixTime::since_unix_epoch(Duration::from_secs(
+            self.0.load(Ordering::SeqCst),
+        )))
+    }
+}
+
+/// Issues tickets with a `ticket_lifetime` of zero.
+#[derive(Debug)]
+struct ZeroLifetimeTicketer(Arc<dyn TicketProducer>);
+
+impl TicketProducer for ZeroLifetimeTicketer {
+    fn encrypt(&self, plain: &[u8]) -> Option<Vec<u8>> {
+        self.0.encrypt(plain)
+    }
+
+    fn decrypt(&self, cipher: &[u8]) -> Option<Vec<u8>> {
+        self.0.decrypt(cipher)
+    }
+
+    fn lifetime(&self) -> Duration {
+        Duration::ZERO
+    }
+}

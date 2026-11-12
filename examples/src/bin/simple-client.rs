@@ -1,0 +1,74 @@
+//! This is the simplest possible client using rustls that does something useful:
+//! it accepts the default configuration, loads some root certs, and then connects
+//! to rust-lang.org and issues a basic HTTP request.  The response is printed to stdout.
+//!
+//! It makes use of rustls::Stream to treat the underlying TLS connection as a basic
+//! bi-directional stream -- the underlying IO is performed transparently.
+//!
+//! Note that `unwrap()` is used to deal with networking errors; this is not something
+//! that is sensible outside of example code.
+
+use std::io::{Read, Write, stdout};
+use std::net::TcpStream;
+use std::sync::Arc;
+
+use rustls::{ClientConfig, RootCertStore, VecInput};
+use rustls_util::Stream;
+
+fn main() {
+    let root_store = RootCertStore {
+        roots: webpki_roots::TLS_SERVER_ROOTS.into(),
+    };
+
+    #[cfg_attr(not(debug_assertions), expect(unused_mut))]
+    let mut config = ClientConfig::builder(rustls_aws_lc_rs::DEFAULT_PROVIDER.into())
+        .with_root_certificates(root_store)
+        .with_no_client_auth()
+        .unwrap();
+
+    // Allow using SSLKEYLOGFILE in debug builds.
+    #[cfg(debug_assertions)]
+    {
+        config.key_log = Arc::new(rustls_util::KeyLogFile::new());
+    }
+
+    let server_name = "www.rust-lang.org".try_into().unwrap();
+    let mut output = Vec::new();
+    let mut conn = Arc::new(config)
+        .connect(server_name)
+        .build(&mut output)
+        .unwrap();
+    let mut sock = TcpStream::connect("www.rust-lang.org:443").unwrap();
+    let mut input = VecInput::default();
+    let mut received_plaintext = Vec::new();
+    let mut tls = Stream::new(
+        &mut input,
+        &mut received_plaintext,
+        &mut output,
+        &mut conn,
+        &mut sock,
+    );
+
+    tls.write_all(
+        concat!(
+            "GET / HTTP/1.1\r\n",
+            "Host: www.rust-lang.org\r\n",
+            "Connection: close\r\n",
+            "Accept-Encoding: identity\r\n",
+            "\r\n"
+        )
+        .as_bytes(),
+    )
+    .unwrap();
+
+    let ciphersuite = tls
+        .conn
+        .negotiated_cipher_suite()
+        .unwrap();
+
+    eprintln!("Current ciphersuite: {:?}", ciphersuite.suite());
+
+    let mut plaintext = Vec::new();
+    tls.read_to_end(&mut plaintext).unwrap();
+    stdout().write_all(&plaintext).unwrap();
+}

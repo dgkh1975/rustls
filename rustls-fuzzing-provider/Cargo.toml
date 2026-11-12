@@ -1,0 +1,15 @@
+[package]
+name = "rustls-fuzzing-provider"
+version = "0.1.0"
+edition.workspace = true
+publish = false
+
+[dependencies]
+rustls = { path = "../rustls", default-features = false, features = ["tracing", "webpki"] }
+
+[dev-dependencies]
+rustls = { path = "../rustls", default-features = false, features = ["std"] }
+tracing-subscriber = { workspace = true }
+
+[lints]
+workspace = true

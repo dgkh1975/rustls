@@ -1,88 +1,122 @@
 //! # Rustls - a modern TLS library
+//!
 //! Rustls is a TLS library that aims to provide a good level of cryptographic security,
 //! requires no configuration to achieve that security, and provides no unsafe features or
-//! obsolete cryptography.
+//! obsolete cryptography by default.
 //!
-//! ## Current features
-//!
-//! * TLS1.2 and TLS1.3.
-//! * ECDSA, Ed25519 or RSA server authentication by clients.
-//! * ECDSA, Ed25519 or RSA server authentication by servers.
-//! * Forward secrecy using ECDHE; with curve25519, nistp256 or nistp384 curves.
-//! * AES128-GCM and AES256-GCM bulk encryption, with safe nonces.
-//! * ChaCha20-Poly1305 bulk encryption ([RFC7905](https://tools.ietf.org/html/rfc7905)).
-//! * ALPN support.
-//! * SNI support.
-//! * Tunable MTU to make TLS messages match size of underlying transport.
-//! * Optional use of vectored IO to minimise system calls.
-//! * TLS1.2 session resumption.
-//! * TLS1.2 resumption via tickets (RFC5077).
-//! * TLS1.3 resumption via tickets or session storage.
-//! * TLS1.3 0-RTT data for clients.
-//! * Client authentication by clients.
-//! * Client authentication by servers.
-//! * Extended master secret support (RFC7627).
-//! * Exporters (RFC5705).
-//! * OCSP stapling by servers.
-//! * SCT stapling by servers.
-//! * SCT verification by clients.
-//!
-//! ## Possible future features
-//!
-//! * PSK support.
-//! * OCSP verification by clients.
-//! * Certificate pinning.
-//!
-//! ## Non-features
-//!
-//! The following things are broken, obsolete, badly designed, underspecified,
-//! dangerous and/or insane. Rustls does not support:
-//!
-//! * SSL1, SSL2, SSL3, TLS1 or TLS1.1.
-//! * RC4.
-//! * DES or triple DES.
-//! * EXPORT ciphersuites.
-//! * MAC-then-encrypt ciphersuites.
-//! * Ciphersuites without forward secrecy.
-//! * Renegotiation.
-//! * Kerberos.
-//! * Compression.
-//! * Discrete-log Diffie-Hellman.
-//! * Automatic protocol version downgrade.
-//! * AES-GCM with unsafe nonces.
-//!
-//! There are plenty of other libraries that provide these features should you
-//! need them.
+//! Rustls implements TLS1.2 and TLS1.3 for both clients and servers. See [the full
+//! list of protocol features](manual::_04_features).
 //!
 //! ### Platform support
 //!
-//! Rustls uses [`ring`](https://crates.io/crates/ring) for implementing the
-//! cryptography in TLS. As a result, rustls only runs on platforms
-//! [supported by `ring`](https://github.com/briansmith/ring#online-automated-testing).
-//! At the time of writing this means x86, x86-64, armv7, and aarch64.
+//! While Rustls itself is platform independent, it requires the use of cryptography primitives
+//! for implementing the cryptography algorithms used in TLS. In Rustls, a
+//! [`crypto::CryptoProvider`] represents a collection of crypto primitive implementations.
 //!
-//! ## Design Overview
+//! By providing a custom instance of the [`crypto::CryptoProvider`] struct, you
+//! can replace all cryptography dependencies of rustls.  This is a route to being portable
+//! to a wider set of architectures and environments, or compliance requirements.  See the
+//! [`crypto::CryptoProvider`] documentation for more details.
+//!
+//! [`crypto::CryptoProvider`]: crate::crypto::CryptoProvider
+//!
+//! ### Cryptography providers
+//!
+//! Since Rustls 0.22 it has been possible to choose the provider of the cryptographic primitives
+//! that Rustls uses. This may be appealing if you have specific platform, compliance or feature
+//! requirements.
+//!
+//! From 0.24, users must explicitly provide a crypto provider when constructing `ClientConfig` or
+//! `ServerConfig` instances. See the [`crypto::CryptoProvider`] documentation for more details.
+//!
+//! #### First-party providers
+//!
+//! The Rustls project currently maintains two cryptography providers:
+//!
+//! * [`rustls-aws-lc-rs`] - a provider that uses the [`aws-lc-rs`] crate for cryptography.
+//!   While this provider can be harder to build on [some platforms][aws-lc-rs-platforms-faq], it provides excellent
+//!   performance and a complete feature set (including post-quantum algorithms).
+//! * [`rustls-ring`] - a provider that uses the [`ring`] crate for cryptography. This
+//!   provider is easier to build on a variety of platforms, but has a more limited feature set
+//!   (for example, it does not support post-quantum algorithms).
+//!
+//! The Rustls team recommends using the [`rustls-aws-lc-rs`] crate for its complete feature set
+//! and performance. See [the aws-lc-rs FAQ][aws-lc-rs-platforms-faq] for more details of the
+//! platform/architecture support constraints in aws-lc-rs.
+//!
+//! See the documentation for [`crypto::CryptoProvider`] for details on how providers are
+//! selected.
+//!
+//! (For rustls versions prior to 0.24, both of these providers were shipped as part of the rustls
+//! crate, and Cargo features were used to select the preferred provider. The `aws-lc-rs` feature
+//! was enabled by default.)
+//!
+//! [`rustls-aws-lc-rs`]: https://crates.io/crates/rustls-aws-lc-rs
+//! [`aws-lc-rs`]: https://crates.io/crates/aws-lc-rs
+//! [aws-lc-rs-platforms-faq]: https://aws.github.io/aws-lc-rs/faq.html#can-i-run-aws-lc-rs-on-x-platform-or-architecture
+//! [`rustls-ring`]: https://crates.io/crates/rustls-ring
+//! [`ring`]: https://crates.io/crates/ring
+//!
+//! #### Third-party providers
+//!
+//! The community has also developed many third-party providers for Rustls. Some of particular note
+//! include:
+//!
+//!   * [`rustls-graviola`] - a provider that uses [`graviola`] for cryptography.
+//!   * [`rustls-symcrypt`] - a provider that uses Microsoft's [SymCrypt] library.
+//!
+//! [`rustls-graviola`]: https://crates.io/crates/rustls-graviola
+//! [`graviola`]: https://github.com/ctz/graviola
+//! [`rustls-symcrypt`]: https://github.com/microsoft/rustls-symcrypt
+//! [SymCrypt]: https://github.com/microsoft/SymCrypt
+//! [`rustls-openssl`]: https://github.com/tofay/rustls-openssl
+//! [OpenSSL]: https://openssl-library.org/
+//!
+//! For more third-party providers, see [PROVIDERS.md].
+//!
+//! See the [Making a custom CryptoProvider] section of the documentation for more information
+//! on this topic.
+//!
+//! [Making a custom CryptoProvider]: https://docs.rs/rustls/latest/rustls/crypto/struct.CryptoProvider.html#making-a-custom-cryptoprovider
+//! [PROVIDERS.md]: https://github.com/rustls/rustls/blob/main/PROVIDERS.md
+//!
+//! ## Design overview
+//!
+//! Rustls is a low-level library. If your goal is to make HTTPS connections you may prefer
+//! to use a library built on top of Rustls like [hyper] or [ureq].
+//!
+//! [hyper]: https://crates.io/crates/hyper
+//! [ureq]: https://crates.io/crates/ureq
+//!
 //! ### Rustls does not take care of network IO
 //! It doesn't make or accept TCP connections, or do DNS, or read or write files.
 //!
-//! There's example client and server code which uses mio to do all needed network
-//! IO.
+//! Our [examples] directory contains demos that show how to handle I/O using the
+//! `rustls_util::Stream` helper, as well as more complex asynchronous I/O using [`mio`].
+//! If you're already using Tokio for an async runtime you may prefer to use [`tokio-rustls`] instead
+//! of interacting with rustls directly.
+//!
+//! [examples]: https://github.com/rustls/rustls/tree/main/examples
+//! [`tokio-rustls`]: https://github.com/rustls/tokio-rustls
 //!
 //! ### Rustls provides encrypted pipes
-//! These are the `ServerSession` and `ClientSession` types.  You supply raw TLS traffic
-//! on the left (via the `read_tls()` and `write_tls()` methods) and then read/write the
-//! plaintext on the right:
+//! These are the [`Connection<ServerSide, Tcp>`] and [`Connection<ClientSide, Tcp>`] types.  A connection can be viewed as two directions.
+//! In the _receive_ direction [`read_tls()`] takes received TLS data and yields application data.
+//! In the _send_ direction [`write()`] takes application data and yields TLS data to send.
+//!
+//! [`write()`]: Connection::write
+//! [`read_tls()`]: Connection::read_tls
 //!
 //! ```text
 //!          TLS                                   Plaintext
 //!          ===                                   =========
-//!     read_tls()      +-----------------------+      io::Read
-//!                     |                       |
-//!           +--------->     ClientSession     +--------->
-//!                     |          or           |
-//!           <---------+     ServerSession     <---------+
-//!                     |                       |
-//!     write_tls()     +-----------------------+      io::Write
+//!             read_tls()  +----------------------------------+      MessageHandler
+//!                         |                                  |
+//!               +--------->   Connection<ClientSide, Tcp>    +--------->
+//!                         |          or                      |
+//!               <---------+   Connection<ServerSide, Tcp>    <---------+
+//!                         |                                  |
+//!          &mut Vec<u8>   +----------------------------------+      write()
 //! ```
 //!
 //! ### Rustls takes care of server certificate verification
@@ -92,74 +126,127 @@
 //! ## Getting started
 //! This is the minimum you need to do to make a TLS client connection.
 //!
-//! First, we make a `ClientConfig`.  You're likely to make one of these per process,
-//! and use it for all connections made by that process.
-//!
-//! ```
-//! let mut config = rustls::ClientConfig::new();
-//! ```
-//!
-//! Next we load some root certificates.  These are used to authenticate the server.
-//! The recommended way is to depend on the `webpki_roots` crate which contains
+//! First we load some root certificates.  These are used to authenticate the server.
+//! The simplest way is to depend on the [`webpki_roots`] crate which contains
 //! the Mozilla set of root certificates.
 //!
-//! ```rust,ignore
-//! config.root_store.add_server_trust_anchors(&webpki_roots::TLS_SERVER_ROOTS);
+//! ```rust,no_run
+//! let root_store = rustls::RootCertStore::from_iter(
+//!     webpki_roots::TLS_SERVER_ROOTS
+//!         .iter()
+//!         .cloned(),
+//! );
 //! ```
 //!
-//! Now we can make a session.  You need to provide the server's hostname so we
+//! [`webpki_roots`]: https://crates.io/crates/webpki-roots
+//!
+//! Next, we make a `ClientConfig`.  You're likely to make one of these per process,
+//! and use it for all connections made by that process.
+//!
+//! ```rust,no_run
+//! # let provider: std::sync::Arc<rustls::crypto::CryptoProvider> = unreachable!();
+//! # let root_store: rustls::RootCertStore = panic!();
+//! let config = rustls::ClientConfig::builder(provider)
+//!     .with_root_certificates(root_store)
+//!     .with_no_client_auth()
+//!     .unwrap();
+//! ```
+//!
+//! Now we can make a connection.  You need to provide the server's hostname so we
 //! know what to expect to find in the server's certificate.
 //!
-//! ```no_run
+//! ```rust,no_run
 //! # use rustls;
 //! # use webpki;
 //! # use std::sync::Arc;
-//! # let mut config = rustls::ClientConfig::new();
-//! let rc_config = Arc::new(config);
-//! let example_com = webpki::DNSNameRef::try_from_ascii_str("example.com").unwrap();
-//! let mut client = rustls::ClientSession::new(&rc_config, example_com);
+//! # let provider: Arc<rustls::crypto::CryptoProvider> = unreachable!();
+//! # let root_store = rustls::RootCertStore::from_iter(
+//! #  webpki_roots::TLS_SERVER_ROOTS
+//! #      .iter()
+//! #      .cloned(),
+//! # );
+//! # let client_config = Arc::new(rustls::ClientConfig::builder(provider)
+//! #     .with_root_certificates(root_store)
+//! #     .with_no_client_auth()
+//! #     .unwrap());
+//!
+//! let example_com = "example.com".try_into().unwrap();
+//! let mut output = Vec::new();
+//! let mut client = client_config.connect(example_com)
+//!     .build(&mut output)
+//!     .unwrap();
 //! ```
 //!
-//! Now you should do appropriate IO for the `client` object.  If `client.wants_read()` yields
-//! true, you should call `client.read_tls()` when the underlying connection has data.
-//! Likewise, if `client.wants_write()` yields true, you should call `client.write_tls()`
-//! when the underlying connection is able to send data.  You should continue doing this
-//! as long as the connection is valid.
+//! Now you should do appropriate IO for the `client` object.  Operations that produce TLS
+//! data to send to the peer -- such as `build()` above and `client.read_tls()` --
+//! append it to the `Vec<u8>` you pass; write those bytes to the underlying connection
+//! whenever it is able to send data. If no error has been received and no received plaintext is
+//! buffered, you should call `client.read_tls()` with the data from the underlying connection.
+//! You should continue doing this as long as the connection is valid.
 //!
-//! The return types of `read_tls()` and `write_tls()` only tell you if the IO worked.  No
-//! parsing or processing of the TLS messages is done.  After each `read_tls()` you should
-//! therefore call `client.process_new_packets()` which parses and processes the messages.
-//! Any error returned from `process_new_packets` is fatal to the session, and will tell you
-//! why.  For example, if the server's certificate is expired `process_new_packets` will
-//! return `Err(WebPKIError(CertExpired))`.  From this point on, `process_new_packets` will
-//! not do any new work and will return that error continually.
+//! [`read_tls()`] will yield a [`MessageHandler`], which can be used to read all
+//! buffered messages at once (via [`MessageHandler::handle_all()`]) or one at a time (via
+//! [`MessageHandler::next_payload()`]). Any error returned from either of these methods is fatal
+//! to the connection, and will tell you why. For example, if the server's certificate is expired
+//! `Err(InvalidCertificate(Expired))` will be returned. From this point on,
+//! future calls to `MessageHandler` methods will do nothing and yield the same error.
 //!
-//! You can extract newly received data by calling `client.read()` (via the `io::Read`
-//! trait).  You can send data to the peer by calling `client.write()` (via the `io::Write`
-//! trait).  Note that `client.write()` buffers data you send if the TLS session is not
-//! yet established: this is useful for writing (say) a HTTP request, but don't write huge
-//! amounts of data.
+//! Newly received data is available by copying from the `Payload` data returned by
+//! `next_payload()` or written into the given buffer by `handle_all()`.  You can send data
+//! to the peer by calling `client.write()`, which encrypts it into TLS records appended
+//! to your output buffer.  Note that this is only possible once the handshake has completed.
 //!
 //! The following code uses a fictional socket IO API for illustration, and does not handle
 //! errors.
 //!
-//! ```text
+//! ```rust,no_run
+//! # let mut client: rustls::Connection<rustls::ClientSide, rustls::Tcp> = panic!();
+//! # let mut output: Vec<u8> = Vec::new();
+//! # struct Socket { }
+//! # impl Socket {
+//! #   fn ready_for_write(&self) -> bool { false }
+//! #   fn ready_for_read(&self) -> bool { false }
+//! #   fn wait_for_something_to_happen(&self) { }
+//! # }
+//! #
+//! # use std::io::{Read, Write, Result};
+//! # impl Read for Socket {
+//! #   fn read(&mut self, buf: &mut [u8]) -> Result<usize> { panic!() }
+//! # }
+//! # impl Write for Socket {
+//! #   fn write(&mut self, buf: &[u8]) -> Result<usize> { panic!() }
+//! #   fn flush(&mut self) -> Result<()> { panic!() }
+//! # }
+//! #
+//! # fn connect(_address: &str, _port: u16) -> Socket {
+//! #   panic!();
+//! # }
 //! use std::io;
+//! use rustls::VecInput;
 //!
-//! client.write(b"GET / HTTP/1.0\r\n\r\n").unwrap();
 //! let mut socket = connect("example.com", 443);
+//! let mut input = VecInput::default();
+//! let mut sent_request = false;
+//! let mut plaintext = Vec::new();
 //! loop {
-//!   if client.wants_read() && socket.ready_for_read() {
-//!     client.read_tls(&mut socket).unwrap();
-//!     client.process_new_packets().unwrap();
-//!
-//!     let mut plaintext = Vec::new();
-//!     client.read_to_end(&mut plaintext).unwrap();
+//!   if plaintext.is_empty() && socket.ready_for_read() {
+//!     input.read(&mut socket).unwrap();
+//!     client
+//!       .read_tls(&mut input, &mut output)
+//!       .handle_all(&mut plaintext)
+//!       .unwrap();
 //!     io::stdout().write(&plaintext).unwrap();
+//!     plaintext.clear();
 //!   }
 //!
-//!   if client.wants_write() && socket.ready_for_write() {
-//!     client.write_tls(&mut socket).unwrap();
+//!   if !sent_request && !client.is_handshaking() {
+//!     client.write(b"GET / HTTP/1.0\r\n\r\n".into(), &mut output).unwrap();
+//!     sent_request = true;
+//!   }
+//!
+//!   if !output.is_empty() && socket.ready_for_write() {
+//!     let written = socket.write(&output).unwrap();
+//!     output.drain(..written);
 //!   }
 //!
 //!   socket.wait_for_something_to_happen();
@@ -167,162 +254,228 @@
 //! ```
 //!
 //! # Examples
-//! `tlsserver` and `tlsclient` are full worked examples.  These both use mio.
+//!
+//! You can find several client and server examples of varying complexity in the [examples]
+//! directory, including [`tls-server-mio`](https://github.com/rustls/rustls/blob/main/examples/src/bin/tls-server-mio.rs)
+//! and [`tls-client-mio`](https://github.com/rustls/rustls/blob/main/examples/src/bin/tls-client-mio.rs)
+//! \- full worked examples using [`mio`].
+//!
+//! [`mio`]: https://docs.rs/mio/latest/mio/
+//!
+//! # Manual
+//!
+//! The [rustls manual](crate::manual) explains design decisions and includes how-to guidance.
 //!
 //! # Crate features
 //! Here's a list of what features are exposed by the rustls crate and what
 //! they mean.
 //!
-//! - `logging`: this makes the rustls crate depend on the `log` crate.
-//!   rustls outputs interesting protocol-level messages at `trace!` and `debug!`
-//!   level, and protocol-level errors at `warn!` and `error!` level.  The log
-//!   messages do not contain secret key data, and so are safe to archive without
-//!   affecting session security.  This feature is in the default set.
+//! - `std` (enabled by default): enable functionality which depends on the Rust `std` library.
 //!
-//! - `dangerous_configuration`: this feature enables a `dangerous()` method on
-//!   `ClientConfig` and `ServerConfig` that allows setting inadvisable options,
-//!   such as replacing the certificate verification process.  Applications
-//!   requesting this feature should be reviewed carefully.
+//! - `tracing` (enabled by default): make the rustls crate depend on the `tracing` crate,
+//!   rustls outputs interesting protocol-level messages at `trace!` and `debug!` level,
+//!   and protocol-level errors at `warn!` and `error!` level.  The log messages do not
+//!   contain secret key data, and so are safe to archive without affecting session security.
 //!
-//! - `quic`: this feature exposes additional constructors and functions
-//!   for using rustls as a TLS library for QUIC.  See the `quic` module for
-//!   details of these.  You will only need this if you're writing a QUIC
-//!   implementation.
+//!   To use this with the `log` crate (as used by rustls 0.23 and previous) you should take
+//!   a dependency on the `tracing` crate and activate its `log` or `log-always` feature.
 //!
+//! - `webpki` (enabled by default): make the rustls crate depend on the `rustls-webpki` crate, which
+//!   is used by default to provide built-in certificate verification.  Without this feature, users must
+//!   provide certificate verification themselves.
+//!
+//! - `brotli`: uses the `brotli` crate for RFC 8879 certificate compression support.
+//!
+//! - `zlib`: uses the `zlib-rs` crate for RFC 8879 certificate compression support.
+//!
+//! [x25519mlkem768-manual]: manual::_05_defaults#about-the-post-quantum-secure-key-exchange-x25519mlkem768
 
 // Require docs for public APIs, deny unsafe code, etc.
-#![forbid(unsafe_code, unused_must_use, unstable_features)]
-#![deny(
-    trivial_casts,
-    trivial_numeric_casts,
-    missing_docs,
-    unused_import_braces,
-    unused_extern_crates,
-    unused_qualifications
-)]
-// Relax these clippy lints:
-// - ptr_arg: this triggers on references to type aliases that are Vec
-//   underneath.
-#![cfg_attr(feature = "cargo-clippy", allow(clippy::ptr_arg))]
+#![warn(missing_docs, clippy::exhaustive_enums, clippy::exhaustive_structs)]
+#![forbid(unsafe_code, unused_must_use)]
+#![cfg_attr(not(any(bench, coverage_nightly)), forbid(unstable_features))]
 // Enable documentation for all features on docs.rs
-#![cfg_attr(docsrs, feature(doc_cfg))]
+#![cfg_attr(rustls_docsrs, feature(doc_cfg))]
+// Enable coverage() attr for nightly coverage builds, see
+// <https://github.com/rust-lang/rust/issues/84605>
+// (`coverage_nightly` is a cfg set by `cargo-llvm-cov`)
+#![cfg_attr(coverage_nightly, feature(coverage_attribute))]
+#![cfg_attr(bench, feature(test))]
+#![no_std]
 
-// log for logging (optional).
-#[cfg(feature = "logging")]
-use log;
+extern crate alloc;
+// This `extern crate` plus the `#![no_std]` attribute changes the default prelude from
+// `std::prelude` to `core::prelude`. That forces one to _explicitly_ import (`use`) everything that
+// is in `std::prelude` but not in `core::prelude`. This helps maintain no-std support as even
+// developers that are not interested in, or aware of, no-std support and / or that never run
+// `cargo build --no-default-features` locally will get errors when they rely on `std::prelude` API.
+#[cfg(feature = "std")]
+extern crate std;
 
-#[cfg(not(feature = "logging"))]
-#[macro_use]
-mod log {
-    macro_rules! trace    ( ($($tt:tt)*) => {{}} );
-    macro_rules! debug    ( ($($tt:tt)*) => {{}} );
-    macro_rules! warn     ( ($($tt:tt)*) => {{}} );
-    macro_rules! error    ( ($($tt:tt)*) => {{}} );
+#[cfg(doc)]
+use crate::crypto::CryptoProvider;
+
+// Import `test` sysroot crate for `Bencher` definitions.
+#[cfg(bench)]
+#[allow(unused_extern_crates)]
+extern crate test;
+
+#[cfg(feature = "tracing")]
+#[expect(clippy::single_component_path_imports)]
+use tracing;
+
+#[cfg(not(feature = "tracing"))]
+mod tracing {
+    macro_rules! trace    ( ($($tt:tt)*) => { crate::tracing::_used!($($tt)*) } );
+    macro_rules! debug    ( ($($tt:tt)*) => { crate::tracing::_used!($($tt)*) } );
+    macro_rules! error    ( ($($tt:tt)*) => { crate::tracing::_used!($($tt)*) } );
+    macro_rules! _warn    ( ($($tt:tt)*) => { crate::tracing::_used!($($tt)*) } );
+    macro_rules! _used    ( ($($tt:tt)*) => { { let _ = format_args!($($tt)*); } } );
+    pub(crate) use _used;
+    pub(crate) use _warn as warn;
+    pub(crate) use debug;
+    pub(crate) use error;
+    pub(crate) use trace;
 }
 
-#[allow(missing_docs)]
+/// This internal `sync` module aliases the `Arc` implementation to allow downstream forks
+/// of rustls targeting architectures without atomic pointers to replace the implementation
+/// with another implementation such as `portable_atomic_util::Arc` in one central location.
+mod sync {
+    #[expect(clippy::disallowed_types)]
+    pub(crate) type Arc<T> = alloc::sync::Arc<T>;
+}
+
+#[expect(unnameable_types)]
 #[macro_use]
 mod msgs;
-mod anchors;
-mod cipher;
-mod error;
+mod common_state;
+pub mod compress;
+mod conn;
+/// Crypto provider interface.
+pub mod crypto;
+pub mod error;
 mod hash_hs;
-mod key_schedule;
-mod prf;
-mod rand;
-mod record_layer;
-mod session;
-mod stream;
-mod vecbuf;
+#[cfg(feature = "std")]
+mod limited_cache;
+mod tls12;
+mod tls13;
 mod verify;
-#[cfg(test)]
-mod verifybench;
 mod x509;
 #[macro_use]
 mod check;
 mod bs_debug;
-mod client;
-mod key;
-mod keylog;
-mod server;
+mod builder;
+pub mod enums;
+mod key_log;
 mod suites;
-mod ticketer;
+mod versions;
+#[cfg(feature = "webpki")]
+mod webpki;
 
-/// Internal classes which may be useful outside the library.
+/// Internal classes that are used in integration tests.
 /// The contents of this section DO NOT form part of the stable interface.
+#[doc(hidden)]
 pub mod internal {
-    /// Low-level TLS message parsing and encoding functions.
-    pub mod msgs {
-        pub use crate::msgs::*;
-    }
+    pub use crate::msgs::fuzzing;
 }
 
 // The public interface is:
-pub use crate::anchors::{DistinguishedNames, OwnedTrustAnchor, RootCertStore};
-pub use crate::client::handy::{ClientSessionMemoryCache, NoClientSessionStorage};
-pub use crate::client::ResolvesClientCert;
-pub use crate::client::StoresClientSessions;
-pub use crate::client::{ClientConfig, ClientSession, WriteEarlyData};
-pub use crate::error::TLSError;
-pub use crate::key::{Certificate, PrivateKey};
-pub use crate::keylog::{KeyLog, KeyLogFile, NoKeyLog};
-pub use crate::msgs::enums::CipherSuite;
-pub use crate::msgs::enums::ProtocolVersion;
-pub use crate::msgs::enums::SignatureScheme;
-pub use crate::server::handy::ResolvesServerCertUsingSNI;
-pub use crate::server::handy::{NoServerSessionStorage, ServerSessionMemoryCache};
-pub use crate::server::StoresServerSessions;
-pub use crate::server::{ClientHello, ProducesTickets, ResolvesServerCert};
-pub use crate::server::{ServerConfig, ServerSession};
-pub use crate::session::Session;
-pub use crate::stream::{Stream, StreamOwned};
-pub use crate::suites::{BulkAlgorithm, SupportedCipherSuite, ALL_CIPHERSUITES};
-pub use crate::ticketer::Ticketer;
-pub use crate::verify::{
-    AllowAnyAnonymousOrAuthenticatedClient, AllowAnyAuthenticatedClient, NoClientAuth,
+pub use crate::builder::{ConfigBuilder, ConfigSide, WantsVerifier};
+pub use crate::common_state::{CommonState, ConnectionOutputs, HandshakeKind, Protocol};
+pub use crate::conn::{
+    Connection, IoState, KeyingMaterialExporter, MessageHandler, NeedsInput, SideData, SliceInput,
+    Tcp, TlsInputBuffer, Transport, VecInput, VerifyPeerIdentity, kernel,
 };
-
-/// All defined ciphersuites appear in this module.
+/// Types related to "split" mode.
 ///
-/// ALL_CIPHERSUITES is provided an array of all of these values.
-pub mod ciphersuite {
-    pub use crate::suites::TLS13_AES_128_GCM_SHA256;
-    pub use crate::suites::TLS13_AES_256_GCM_SHA384;
-    pub use crate::suites::TLS13_CHACHA20_POLY1305_SHA256;
-    pub use crate::suites::TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256;
-    pub use crate::suites::TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384;
-    pub use crate::suites::TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256;
-    pub use crate::suites::TLS_ECDHE_RSA_WITH_AES_128_GCM_SHA256;
-    pub use crate::suites::TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384;
-    pub use crate::suites::TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256;
+/// See [`split::SplitConnection`] for more information.
+#[cfg(feature = "std")]
+pub mod split {
+    pub use crate::conn::split::{
+        FlushSender, ReceiveTraffic, ReceiveTrafficState, ReceivedApplicationData, SendTraffic,
+        SplitConnection,
+    };
+}
+pub use crate::error::Error;
+pub use crate::key_log::{KeyLog, NoKeyLog};
+pub use crate::suites::{
+    CipherSuiteCommon, ConnectionTrafficSecrets, ExtractedSecrets, SupportedCipherSuite,
+};
+#[cfg(feature = "std")]
+pub use crate::ticketer::TicketRotator;
+pub use crate::tls12::Tls12CipherSuite;
+pub use crate::tls13::Tls13CipherSuite;
+pub use crate::verify::{DigitallySignedStruct, DistinguishedName, SignerPublicKey};
+pub use crate::versions::{ALL_VERSIONS, DEFAULT_VERSIONS, SupportedProtocolVersion};
+#[cfg(feature = "webpki")]
+pub use crate::webpki::RootCertStore;
+
+/// Items for use in a client.
+pub mod client;
+pub use client::{ClientConfig, ClientSide};
+
+/// Items for use in a server.
+pub mod server;
+pub use server::{ServerConfig, ServerSide};
+
+/// All defined protocol versions appear in this module.
+///
+/// ALL_VERSIONS is provided as an array of all of these values.
+pub mod version {
+    pub use crate::versions::{
+        TLS12, TLS12_VERSION, TLS13, TLS13_VERSION, Tls12Version, Tls13Version,
+    };
 }
 
-/// Message signing interfaces and implementations.
-pub mod sign;
+/// Re-exports the contents of the [rustls-pki-types](https://docs.rs/rustls-pki-types) crate for easy access
+pub mod pki_types {
+    #[doc(no_inline)]
+    pub use pki_types::*;
+}
 
-#[cfg(feature = "quic")]
-#[cfg_attr(docsrs, doc(cfg(feature = "quic")))]
 /// APIs for implementing QUIC TLS
 pub mod quic;
 
-#[cfg(not(feature = "quic"))]
-// If QUIC support is disabled, just define a private module with an empty
-// trait to allow Session having QuicExt as a trait bound.
-mod quic {
-    pub trait QuicExt {}
-    impl QuicExt for super::ClientSession {}
-    impl QuicExt for super::ServerSession {}
-}
-
-#[cfg(feature = "dangerous_configuration")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dangerous_configuration")))]
-pub use crate::client::danger::DangerousClientConfig;
-#[cfg(feature = "dangerous_configuration")]
-#[cfg_attr(docsrs, doc(cfg(feature = "dangerous_configuration")))]
-pub use crate::verify::{
-    ClientCertVerified, ClientCertVerifier, HandshakeSignatureValid, ServerCertVerified,
-    ServerCertVerifier, WebPKIVerifier,
-};
+/// APIs for implementing TLS tickets
+#[cfg(feature = "std")]
+pub mod ticketer;
 
 /// This is the rustls manual.
 pub mod manual;
+
+pub mod time_provider;
+
+/// APIs abstracting over locking primitives.
+#[cfg(feature = "std")]
+pub mod lock;
+
+#[cfg(feature = "std")]
+mod hash_map {
+    pub(crate) use std::collections::HashMap;
+    pub(crate) use std::collections::hash_map::Entry;
+}
+
+mod sealed {
+    #[expect(unnameable_types)]
+    pub trait Sealed {}
+}
+
+mod core_hash_polyfill {
+    use core::hash::Hasher;
+
+    /// Working around `core::hash::Hasher` not being dyn-compatible
+    pub(super) struct DynHasher<'a>(pub(crate) &'a mut dyn Hasher);
+
+    impl Hasher for DynHasher<'_> {
+        fn finish(&self) -> u64 {
+            self.0.finish()
+        }
+
+        fn write(&mut self, bytes: &[u8]) {
+            self.0.write(bytes)
+        }
+    }
+}
+
+pub(crate) use core_hash_polyfill::DynHasher;

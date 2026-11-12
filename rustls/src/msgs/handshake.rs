@@ -1,112 +1,123 @@
-use crate::key;
-use crate::msgs::base::{Payload, PayloadU8, PayloadU16, PayloadU24};
-use crate::msgs::codec;
-use crate::msgs::codec::{Codec, Reader};
-use crate::msgs::enums::ECCurveType;
-use crate::msgs::enums::PSKKeyExchangeMode;
-use crate::msgs::enums::{CertificateStatusType, ClientCertificateType};
-use crate::msgs::enums::{CipherSuite, Compression, ECPointFormat, ExtensionType};
-use crate::msgs::enums::{HandshakeType, ProtocolVersion};
-use crate::msgs::enums::{HashAlgorithm, ServerNameType, SignatureAlgorithm};
-use crate::msgs::enums::{KeyUpdateRequest, NamedGroup, SignatureScheme};
+use alloc::collections::BTreeSet;
+use alloc::vec;
+use alloc::vec::Vec;
+use core::ops::{Deref, DerefMut};
+use core::time::Duration;
+use core::{fmt, iter};
 
-#[cfg(feature = "logging")]
-use crate::log::warn;
+use pki_types::CertificateDer;
 
-use std::collections;
-use std::fmt;
-use std::io::Write;
-use std::mem;
-use webpki;
+use crate::crypto::cipher::Payload;
+use crate::crypto::kx::ffdhe::FfdheGroup;
+use crate::crypto::kx::{ActiveKeyExchange, KeyExchangeAlgorithm, NamedGroup};
+use crate::crypto::{
+    CipherSuite, GetRandomFailed, SecureRandom, SelectedCredential, SignatureScheme,
+};
+use crate::enums::{
+    ApplicationProtocol, CertificateCompressionAlgorithm, CertificateType, ProtocolVersion,
+};
+use crate::error::InvalidMessage;
+use crate::msgs::codec::{
+    CERTIFICATE_MAX_SIZE_LIMIT, Codec, LengthPrefixedBuffer, ListLength, MaybeEmpty, NonEmpty,
+    Reader, SizedPayload, TlsListElement, TlsListIter, U24, hex,
+};
+use crate::msgs::enums::{
+    CertificateStatusType, ClientCertificateType, Compression, ECCurveType, ECPointFormat,
+    ExtensionType,
+};
+use crate::sync::Arc;
+use crate::tracing::warn;
+use crate::verify::{DigitallySignedStruct, DistinguishedName};
 
-macro_rules! declare_u8_vec(
-  ($name:ident, $itemtype:ty) => {
-    pub type $name = Vec<$itemtype>;
+#[derive(Clone, Copy, Eq, PartialEq)]
+pub(crate) struct Random(pub(crate) [u8; 32]);
 
-    impl Codec for $name {
-      fn encode(&self, bytes: &mut Vec<u8>) {
-        codec::encode_vec_u8(bytes, self);
-      }
-
-      fn read(r: &mut Reader) -> Option<$name> {
-        codec::read_vec_u8::<$itemtype>(r)
-      }
+impl fmt::Debug for Random {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hex(f, &self.0)
     }
-  }
-);
+}
 
-macro_rules! declare_u16_vec(
-  ($name:ident, $itemtype:ty) => {
-    pub type $name = Vec<$itemtype>;
-
-    impl Codec for $name {
-      fn encode(&self, bytes: &mut Vec<u8>) {
-        codec::encode_vec_u16(bytes, self);
-      }
-
-      fn read(r: &mut Reader) -> Option<$name> {
-        codec::read_vec_u16::<$itemtype>(r)
-      }
-    }
-  }
-);
-
-declare_u16_vec!(VecU16OfPayloadU8, PayloadU8);
-declare_u16_vec!(VecU16OfPayloadU16, PayloadU16);
-
-#[derive(Debug, PartialEq, Clone)]
-pub struct Random([u8; 32]);
-
-static HELLO_RETRY_REQUEST_RANDOM: Random = Random([
+pub(super) const HELLO_RETRY_REQUEST_RANDOM: Random = Random([
     0xcf, 0x21, 0xad, 0x74, 0xe5, 0x9a, 0x61, 0x11, 0xbe, 0x1d, 0x8c, 0x02, 0x1e, 0x65, 0xb8, 0x91,
     0xc2, 0xa2, 0x11, 0x16, 0x7a, 0xbb, 0x8c, 0x5e, 0x07, 0x9e, 0x09, 0xe2, 0xc8, 0xa8, 0x33, 0x9c,
 ]);
 
-static ZERO_RANDOM: Random = Random([0u8; 32]);
-
-impl Codec for Random {
+impl Codec<'_> for Random {
     fn encode(&self, bytes: &mut Vec<u8>) {
         bytes.extend_from_slice(&self.0);
     }
 
-    fn read(r: &mut Reader) -> Option<Random> {
-        let bytes = r.take(32)?;
-        let mut opaque = [0; 32];
-        opaque.clone_from_slice(bytes);
-
-        Some(Random(opaque))
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        r.take_array("Random")
+            .map(|&bytes| Self(bytes))
     }
 }
 
 impl Random {
-    pub fn from_slice(bytes: &[u8]) -> Random {
-        let mut rd = Reader::init(bytes);
-        Random::read(&mut rd).unwrap()
+    pub(crate) fn new(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
+        let mut data = [0u8; 32];
+        secure_random.fill(&mut data)?;
+        Ok(Self(data))
     }
+}
 
-    pub fn write_slice(&self, mut bytes: &mut [u8]) {
-        let buf = self.get_encoding();
-        bytes.write_all(&buf).unwrap();
+impl From<[u8; 32]> for Random {
+    #[inline]
+    fn from(bytes: [u8; 32]) -> Self {
+        Self(bytes)
     }
 }
 
 #[derive(Copy, Clone)]
-pub struct SessionID {
-    len: usize,
+pub(crate) struct SessionId {
     data: [u8; 32],
+    len: usize,
 }
 
-impl fmt::Debug for SessionID {
-    fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
-        let mut t = f.debug_tuple("SessionID");
-        for i in 0..self.len() {
-            t.field(&self.data[i]);
+impl SessionId {
+    pub(crate) fn random(secure_random: &dyn SecureRandom) -> Result<Self, GetRandomFailed> {
+        let mut data = [0u8; 32];
+        secure_random.fill(&mut data)?;
+        Ok(Self { data, len: 32 })
+    }
+
+    pub(crate) fn empty() -> Self {
+        Self {
+            data: [0u8; 32],
+            len: 0,
         }
-        t.finish()
+    }
+
+    pub(crate) fn is_empty(&self) -> bool {
+        self.len == 0
     }
 }
 
-impl PartialEq for SessionID {
+impl Codec<'_> for SessionId {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        debug_assert!(self.len <= 32);
+        bytes.push(self.len as u8);
+        bytes.extend_from_slice(self.as_ref());
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let len = u8::read(r)? as usize;
+        if len > 32 {
+            return Err(InvalidMessage::TrailingData("SessionID"));
+        }
+
+        let Some(bytes) = r.take(len) else {
+            return Err(InvalidMessage::MissingData("SessionID"));
+        };
+
+        let mut out = [0u8; 32];
+        out[..len].clone_from_slice(&bytes[..len]);
+        Ok(Self { data: out, len })
+    }
+}
+
+impl PartialEq for SessionId {
     fn eq(&self, other: &Self) -> bool {
         if self.len != other.len {
             return false;
@@ -114,1510 +125,796 @@ impl PartialEq for SessionID {
 
         let mut diff = 0u8;
         for i in 0..self.len {
-            diff |= self.data[i] ^ other.data[i]
+            diff |= self.data[i] ^ other.data[i];
         }
 
         diff == 0u8
     }
 }
 
-impl Codec for SessionID {
+impl AsRef<[u8]> for SessionId {
+    fn as_ref(&self) -> &[u8] {
+        &self.data[..self.len]
+    }
+}
+
+impl fmt::Debug for SessionId {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        hex(f, &self.data[..self.len])
+    }
+}
+
+#[derive(Clone, Copy, Debug)]
+pub(crate) struct SupportedEcPointFormats {
+    pub(crate) uncompressed: bool,
+}
+
+impl Codec<'_> for SupportedEcPointFormats {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        debug_assert!(self.len <= 32);
-        bytes.push(self.len as u8);
-        bytes.extend_from_slice(&self.data[..self.len]);
+        let inner = LengthPrefixedBuffer::new(ECPointFormat::SIZE_LEN, bytes);
+
+        if self.uncompressed {
+            ECPointFormat::Uncompressed.encode(inner.buf);
+        }
     }
 
-    fn read(r: &mut Reader) -> Option<SessionID> {
-        let len = u8::read(r)? as usize;
-        if len > 32 {
-            return None;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let mut uncompressed = false;
+
+        for pf in TlsListIter::<ECPointFormat>::new(r)? {
+            if let ECPointFormat::Uncompressed = pf? {
+                uncompressed = true;
+            }
         }
 
-        let bytes = r.take(len)?;
-        let mut out = [0u8; 32];
-        out[..len].clone_from_slice(&bytes[..len]);
-
-        Some(SessionID { data: out, len })
+        Ok(Self { uncompressed })
     }
 }
 
-impl SessionID {
-    pub fn new(bytes: &[u8]) -> SessionID {
-        debug_assert!(bytes.len() <= 32);
-        let mut d = [0u8; 32];
-        d[..bytes.len()].clone_from_slice(&bytes[..]);
-
-        SessionID {
-            data: d,
-            len: bytes.len(),
-        }
-    }
-
-    pub fn empty() -> SessionID {
-        SessionID {
-            data: [0u8; 32],
-            len: 0,
-        }
-    }
-
-    pub fn len(&self) -> usize {
-        self.len
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.len == 0
+impl Default for SupportedEcPointFormats {
+    fn default() -> Self {
+        Self { uncompressed: true }
     }
 }
 
+/// RFC 8422: `ECPointFormat ec_point_format_list<1..2^8-1>`
+impl TlsListElement for ECPointFormat {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("ECPointFormats"),
+    };
+}
+
+/// RFC 8422: `NamedCurve named_curve_list<2..2^16-1>`
+impl TlsListElement for NamedGroup {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::IllegalEmptyList("NamedGroups"),
+    };
+}
+
+/// RFC 9846: `SignatureScheme supported_signature_algorithms<2..2^16-2>;`
+impl TlsListElement for SignatureScheme {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::NoSignatureSchemes,
+    };
+}
+
+/// RFC 7301 encodes a single protocol name as `Vec<ProtocolName>`
 #[derive(Clone, Debug)]
-pub struct UnknownExtension {
-    pub typ: ExtensionType,
-    pub payload: Payload,
+pub(crate) struct SingleProtocolName(ApplicationProtocol<'static>);
+
+impl SingleProtocolName {
+    pub(crate) fn new(single: ApplicationProtocol<'static>) -> Self {
+        Self(single)
+    }
+
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::IllegalEmptyList("ProtocolNames"),
+    };
 }
 
-impl UnknownExtension {
+impl Codec<'_> for SingleProtocolName {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.payload.encode(bytes);
+        let body = LengthPrefixedBuffer::new(Self::SIZE_LEN, bytes);
+        self.0.encode(body.buf);
     }
 
-    fn read(typ: ExtensionType, r: &mut Reader) -> Option<UnknownExtension> {
-        let payload = Payload::read(r)?;
-        Some(UnknownExtension { typ, payload })
-    }
-}
-
-declare_u8_vec!(ECPointFormatList, ECPointFormat);
-
-pub trait SupportedPointFormats {
-    fn supported() -> ECPointFormatList;
-}
-
-impl SupportedPointFormats for ECPointFormatList {
-    fn supported() -> ECPointFormatList {
-        vec![ECPointFormat::Uncompressed]
+    fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let len = Self::SIZE_LEN.read(reader)?;
+        reader
+            .sub(len)?
+            .all("SingleProtocolName", |sub| {
+                Ok(Self(ApplicationProtocol::read(sub)?.to_owned()))
+            })
     }
 }
 
-declare_u16_vec!(NamedGroups, NamedGroup);
-
-declare_u16_vec!(SupportedSignatureSchemes, SignatureScheme);
-
-pub trait DecomposedSignatureScheme {
-    fn sign(&self) -> SignatureAlgorithm;
-    fn make(alg: SignatureAlgorithm, hash: HashAlgorithm) -> SignatureScheme;
-}
-
-impl DecomposedSignatureScheme for SignatureScheme {
-    fn sign(&self) -> SignatureAlgorithm {
-        match *self {
-            SignatureScheme::RSA_PKCS1_SHA1
-            | SignatureScheme::RSA_PKCS1_SHA256
-            | SignatureScheme::RSA_PKCS1_SHA384
-            | SignatureScheme::RSA_PKCS1_SHA512
-            | SignatureScheme::RSA_PSS_SHA256
-            | SignatureScheme::RSA_PSS_SHA384
-            | SignatureScheme::RSA_PSS_SHA512 => SignatureAlgorithm::RSA,
-            SignatureScheme::ECDSA_NISTP256_SHA256
-            | SignatureScheme::ECDSA_NISTP384_SHA384
-            | SignatureScheme::ECDSA_NISTP521_SHA512 => SignatureAlgorithm::ECDSA,
-            _ => SignatureAlgorithm::Unknown(0),
-        }
-    }
-
-    fn make(alg: SignatureAlgorithm, hash: HashAlgorithm) -> SignatureScheme {
-        use crate::msgs::enums::HashAlgorithm::{SHA1, SHA256, SHA384, SHA512};
-        use crate::msgs::enums::SignatureAlgorithm::{ECDSA, RSA};
-
-        match (alg, hash) {
-            (RSA, SHA1) => SignatureScheme::RSA_PKCS1_SHA1,
-            (RSA, SHA256) => SignatureScheme::RSA_PKCS1_SHA256,
-            (RSA, SHA384) => SignatureScheme::RSA_PKCS1_SHA384,
-            (RSA, SHA512) => SignatureScheme::RSA_PKCS1_SHA512,
-            (ECDSA, SHA256) => SignatureScheme::ECDSA_NISTP256_SHA256,
-            (ECDSA, SHA384) => SignatureScheme::ECDSA_NISTP384_SHA384,
-            (ECDSA, SHA512) => SignatureScheme::ECDSA_NISTP521_SHA512,
-            (_, _) => unreachable!(),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum ServerNamePayload {
-    HostName(webpki::DNSName),
-    Unknown(Payload),
-}
-
-impl ServerNamePayload {
-    fn read_hostname(r: &mut Reader) -> Option<ServerNamePayload> {
-        let len = u16::read(r)? as usize;
-        let name = r.take(len)?;
-        let dns_name = match webpki::DNSNameRef::try_from_ascii(name) {
-            Ok(dns_name) => dns_name,
-            Err(_) => {
-                warn!("Illegal SNI hostname received {:?}", name);
-                return None;
-            }
-        };
-        Some(ServerNamePayload::HostName(dns_name.into()))
-    }
-
-    fn encode_hostname(name: webpki::DNSNameRef, bytes: &mut Vec<u8>) {
-        let dns_name_str: &str = name.into();
-        (dns_name_str.len() as u16).encode(bytes);
-        bytes.extend_from_slice(dns_name_str.as_bytes());
-    }
-
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        match *self {
-            ServerNamePayload::HostName(ref r) => {
-                ServerNamePayload::encode_hostname(r.as_ref(), bytes)
-            }
-            ServerNamePayload::Unknown(ref r) => r.encode(bytes),
-        }
-    }
-}
-
-#[derive(Clone, Debug)]
-pub struct ServerName {
-    pub typ: ServerNameType,
-    pub payload: ServerNamePayload,
-}
-
-impl Codec for ServerName {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.typ.encode(bytes);
-        self.payload.encode(bytes);
-    }
-
-    fn read(r: &mut Reader) -> Option<ServerName> {
-        let typ = ServerNameType::read(r)?;
-
-        let payload = match typ {
-            ServerNameType::HostName => ServerNamePayload::read_hostname(r)?,
-            _ => ServerNamePayload::Unknown(Payload::read(r).unwrap()),
-        };
-
-        Some(ServerName { typ, payload })
-    }
-}
-
-declare_u16_vec!(ServerNameRequest, ServerName);
-
-pub trait ConvertServerNameList {
-    fn has_duplicate_names_for_type(&self) -> bool;
-    fn get_single_hostname(&self) -> Option<webpki::DNSNameRef>;
-}
-
-impl ConvertServerNameList for ServerNameRequest {
-    /// RFC6066: "The ServerNameList MUST NOT contain more than one name of the same name_type."
-    fn has_duplicate_names_for_type(&self) -> bool {
-        let mut seen = collections::HashSet::new();
-
-        for name in self {
-            if !seen.insert(name.typ.get_u8()) {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    fn get_single_hostname(&self) -> Option<webpki::DNSNameRef> {
-        fn only_dns_hostnames(name: &ServerName) -> Option<webpki::DNSNameRef> {
-            if let ServerNamePayload::HostName(ref dns) = name.payload {
-                Some(dns.as_ref())
-            } else {
-                None
-            }
-        }
-
-        self.iter()
-            .filter_map(only_dns_hostnames)
-            .nth(0)
-    }
-}
-
-pub type ProtocolNameList = VecU16OfPayloadU8;
-
-pub trait ConvertProtocolNameList {
-    fn from_slices(names: &[&[u8]]) -> Self;
-    fn to_slices(&self) -> Vec<&[u8]>;
-    fn as_single_slice(&self) -> Option<&[u8]>;
-}
-
-impl ConvertProtocolNameList for ProtocolNameList {
-    fn from_slices(names: &[&[u8]]) -> ProtocolNameList {
-        let mut ret = Vec::new();
-
-        for name in names {
-            ret.push(PayloadU8::new(name.to_vec()));
-        }
-
-        ret
-    }
-
-    fn to_slices(&self) -> Vec<&[u8]> {
-        self.iter()
-            .map(|proto| -> &[u8] { &proto.0 })
-            .collect::<Vec<&[u8]>>()
-    }
-
-    fn as_single_slice(&self) -> Option<&[u8]> {
-        if self.len() == 1 {
-            Some(&self[0].0)
-        } else {
-            None
-        }
+impl AsRef<ApplicationProtocol<'static>> for SingleProtocolName {
+    fn as_ref(&self) -> &ApplicationProtocol<'static> {
+        &self.0
     }
 }
 
 // --- TLS 1.3 Key shares ---
 #[derive(Clone, Debug)]
-pub struct KeyShareEntry {
-    pub group: NamedGroup,
-    pub payload: PayloadU16,
+pub(crate) struct KeyShareEntry {
+    pub(crate) group: NamedGroup,
+    /// RFC 9846: `opaque key_exchange<1..2^16-1>;`
+    pub(crate) payload: SizedPayload<'static, u16, NonEmpty>,
 }
 
 impl KeyShareEntry {
-    pub fn new(group: NamedGroup, payload: &[u8]) -> KeyShareEntry {
-        KeyShareEntry {
+    pub(crate) fn new(group: NamedGroup, payload: impl Into<Vec<u8>>) -> Self {
+        Self {
             group,
-            payload: PayloadU16::new(payload.to_vec()),
+            payload: SizedPayload::from(Payload::new(payload.into())),
         }
     }
 }
 
-impl Codec for KeyShareEntry {
+impl Codec<'_> for KeyShareEntry {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.group.encode(bytes);
         self.payload.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<KeyShareEntry> {
-        let group = NamedGroup::read(r)?;
-        let payload = PayloadU16::read(r)?;
-
-        Some(KeyShareEntry { group, payload })
-    }
-}
-
-// --- TLS 1.3 PresharedKey offers ---
-#[derive(Clone, Debug)]
-pub struct PresharedKeyIdentity {
-    pub identity: PayloadU16,
-    pub obfuscated_ticket_age: u32,
-}
-
-impl PresharedKeyIdentity {
-    pub fn new(id: Vec<u8>, age: u32) -> PresharedKeyIdentity {
-        PresharedKeyIdentity {
-            identity: PayloadU16::new(id),
-            obfuscated_ticket_age: age,
-        }
-    }
-}
-
-impl Codec for PresharedKeyIdentity {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.identity.encode(bytes);
-        self.obfuscated_ticket_age.encode(bytes);
-    }
-
-    fn read(r: &mut Reader) -> Option<PresharedKeyIdentity> {
-        Some(PresharedKeyIdentity {
-            identity: PayloadU16::read(r)?,
-            obfuscated_ticket_age: u32::read(r)?,
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            group: NamedGroup::read(r)?,
+            payload: SizedPayload::read(r)?.into_owned(),
         })
-    }
-}
-
-declare_u16_vec!(PresharedKeyIdentities, PresharedKeyIdentity);
-pub type PresharedKeyBinder = PayloadU8;
-pub type PresharedKeyBinders = VecU16OfPayloadU8;
-
-#[derive(Clone, Debug)]
-pub struct PresharedKeyOffer {
-    pub identities: PresharedKeyIdentities,
-    pub binders: PresharedKeyBinders,
-}
-
-impl PresharedKeyOffer {
-    /// Make a new one with one entry.
-    pub fn new(id: PresharedKeyIdentity, binder: Vec<u8>) -> PresharedKeyOffer {
-        PresharedKeyOffer {
-            identities: vec![id],
-            binders: vec![PresharedKeyBinder::new(binder)],
-        }
-    }
-}
-
-impl Codec for PresharedKeyOffer {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.identities.encode(bytes);
-        self.binders.encode(bytes);
-    }
-
-    fn read(r: &mut Reader) -> Option<PresharedKeyOffer> {
-        Some(PresharedKeyOffer {
-            identities: PresharedKeyIdentities::read(r)?,
-            binders: PresharedKeyBinders::read(r)?,
-        })
-    }
-}
-
-// --- RFC6066 certificate status request ---
-type ResponderIDs = VecU16OfPayloadU16;
-
-#[derive(Clone, Debug)]
-pub struct OCSPCertificateStatusRequest {
-    pub responder_ids: ResponderIDs,
-    pub extensions: PayloadU16,
-}
-
-impl Codec for OCSPCertificateStatusRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        CertificateStatusType::OCSP.encode(bytes);
-        self.responder_ids.encode(bytes);
-        self.extensions.encode(bytes);
-    }
-
-    fn read(r: &mut Reader) -> Option<OCSPCertificateStatusRequest> {
-        Some(OCSPCertificateStatusRequest {
-            responder_ids: ResponderIDs::read(r)?,
-            extensions: PayloadU16::read(r)?,
-        })
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum CertificateStatusRequest {
-    OCSP(OCSPCertificateStatusRequest),
-    Unknown((CertificateStatusType, Payload)),
-}
-
-impl Codec for CertificateStatusRequest {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        match *self {
-            CertificateStatusRequest::OCSP(ref r) => r.encode(bytes),
-            CertificateStatusRequest::Unknown((typ, ref payload)) => {
-                typ.encode(bytes);
-                payload.encode(bytes);
-            }
-        }
-    }
-
-    fn read(r: &mut Reader) -> Option<CertificateStatusRequest> {
-        let typ = CertificateStatusType::read(r)?;
-
-        match typ {
-            CertificateStatusType::OCSP => {
-                let ocsp_req = OCSPCertificateStatusRequest::read(r)?;
-                Some(CertificateStatusRequest::OCSP(ocsp_req))
-            }
-            _ => {
-                let data = Payload::read(r)?;
-                Some(CertificateStatusRequest::Unknown((typ, data)))
-            }
-        }
-    }
-}
-
-impl CertificateStatusRequest {
-    pub fn build_ocsp() -> CertificateStatusRequest {
-        let ocsp = OCSPCertificateStatusRequest {
-            responder_ids: ResponderIDs::new(),
-            extensions: PayloadU16::empty(),
-        };
-        CertificateStatusRequest::OCSP(ocsp)
     }
 }
 
 // ---
-// SCTs
 
-pub type SCTList = VecU16OfPayloadU16;
-
-// ---
-
-declare_u8_vec!(PSKKeyExchangeModes, PSKKeyExchangeMode);
-declare_u16_vec!(KeyShareEntries, KeyShareEntry);
-declare_u8_vec!(ProtocolVersions, ProtocolVersion);
-
-#[derive(Clone, Debug)]
-pub enum ClientExtension {
-    ECPointFormats(ECPointFormatList),
-    NamedGroups(NamedGroups),
-    SignatureAlgorithms(SupportedSignatureSchemes),
-    ServerName(ServerNameRequest),
-    SessionTicketRequest,
-    SessionTicketOffer(Payload),
-    Protocols(ProtocolNameList),
-    SupportedVersions(ProtocolVersions),
-    KeyShare(KeyShareEntries),
-    PresharedKeyModes(PSKKeyExchangeModes),
-    PresharedKey(PresharedKeyOffer),
-    Cookie(PayloadU16),
-    ExtendedMasterSecretRequest,
-    CertificateStatusRequest(CertificateStatusRequest),
-    SignedCertificateTimestampRequest,
-    TransportParameters(Vec<u8>),
-    EarlyData,
-    Unknown(UnknownExtension),
+/// RFC 9846: `KeyShareEntry client_shares<0..2^16-1>;`
+impl TlsListElement for KeyShareEntry {
+    const SIZE_LEN: ListLength = ListLength::U16;
 }
 
-impl ClientExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            ClientExtension::ECPointFormats(_) => ExtensionType::ECPointFormats,
-            ClientExtension::NamedGroups(_) => ExtensionType::EllipticCurves,
-            ClientExtension::SignatureAlgorithms(_) => ExtensionType::SignatureAlgorithms,
-            ClientExtension::ServerName(_) => ExtensionType::ServerName,
-            ClientExtension::SessionTicketRequest | ClientExtension::SessionTicketOffer(_) => {
-                ExtensionType::SessionTicket
-            }
-            ClientExtension::Protocols(_) => ExtensionType::ALProtocolNegotiation,
-            ClientExtension::SupportedVersions(_) => ExtensionType::SupportedVersions,
-            ClientExtension::KeyShare(_) => ExtensionType::KeyShare,
-            ClientExtension::PresharedKeyModes(_) => ExtensionType::PSKKeyExchangeModes,
-            ClientExtension::PresharedKey(_) => ExtensionType::PreSharedKey,
-            ClientExtension::Cookie(_) => ExtensionType::Cookie,
-            ClientExtension::ExtendedMasterSecretRequest => ExtensionType::ExtendedMasterSecret,
-            ClientExtension::CertificateStatusRequest(_) => ExtensionType::StatusRequest,
-            ClientExtension::SignedCertificateTimestampRequest => ExtensionType::SCT,
-            ClientExtension::TransportParameters(_) => ExtensionType::TransportParameters,
-            ClientExtension::EarlyData => ExtensionType::EarlyData,
-            ClientExtension::Unknown(ref r) => r.typ,
+/// The body of the `SupportedVersions` extension when it appears in a
+/// `ClientHello`
+///
+/// This is documented as a preference-order vector, but we (as a server)
+/// ignore the preference of the client.
+///
+/// RFC 9846: `ProtocolVersion versions<2..254>;`
+#[derive(Clone, Copy, Debug, Default)]
+pub(crate) struct SupportedProtocolVersions {
+    pub(crate) tls13: bool,
+    pub(crate) tls12: bool,
+}
+
+impl SupportedProtocolVersions {
+    /// Return true if `filter` returns true for any enabled version.
+    pub(crate) fn any(&self, filter: impl Fn(ProtocolVersion) -> bool) -> bool {
+        if self.tls13 && filter(ProtocolVersion::TLSv1_3) {
+            return true;
         }
-    }
-}
-
-impl Codec for ClientExtension {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
-
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            ClientExtension::ECPointFormats(ref r) => r.encode(&mut sub),
-            ClientExtension::NamedGroups(ref r) => r.encode(&mut sub),
-            ClientExtension::SignatureAlgorithms(ref r) => r.encode(&mut sub),
-            ClientExtension::ServerName(ref r) => r.encode(&mut sub),
-            ClientExtension::SessionTicketRequest
-            | ClientExtension::ExtendedMasterSecretRequest
-            | ClientExtension::SignedCertificateTimestampRequest
-            | ClientExtension::EarlyData => {}
-            ClientExtension::SessionTicketOffer(ref r) => r.encode(&mut sub),
-            ClientExtension::Protocols(ref r) => r.encode(&mut sub),
-            ClientExtension::SupportedVersions(ref r) => r.encode(&mut sub),
-            ClientExtension::KeyShare(ref r) => r.encode(&mut sub),
-            ClientExtension::PresharedKeyModes(ref r) => r.encode(&mut sub),
-            ClientExtension::PresharedKey(ref r) => r.encode(&mut sub),
-            ClientExtension::Cookie(ref r) => r.encode(&mut sub),
-            ClientExtension::CertificateStatusRequest(ref r) => r.encode(&mut sub),
-            ClientExtension::TransportParameters(ref r) => sub.extend_from_slice(r),
-            ClientExtension::Unknown(ref r) => r.encode(&mut sub),
+        if self.tls12 && filter(ProtocolVersion::TLSv1_2) {
+            return true;
         }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
-    }
-
-    fn read(r: &mut Reader) -> Option<ClientExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
-        let mut sub = r.sub(len)?;
-
-        Some(match typ {
-            ExtensionType::ECPointFormats => {
-                ClientExtension::ECPointFormats(ECPointFormatList::read(&mut sub)?)
-            }
-            ExtensionType::EllipticCurves => {
-                ClientExtension::NamedGroups(NamedGroups::read(&mut sub)?)
-            }
-            ExtensionType::SignatureAlgorithms => {
-                let schemes = SupportedSignatureSchemes::read(&mut sub)?;
-                ClientExtension::SignatureAlgorithms(schemes)
-            }
-            ExtensionType::ServerName => {
-                ClientExtension::ServerName(ServerNameRequest::read(&mut sub)?)
-            }
-            ExtensionType::SessionTicket => {
-                if sub.any_left() {
-                    let contents = Payload::read(&mut sub).unwrap();
-                    ClientExtension::SessionTicketOffer(contents)
-                } else {
-                    ClientExtension::SessionTicketRequest
-                }
-            }
-            ExtensionType::ALProtocolNegotiation => {
-                ClientExtension::Protocols(ProtocolNameList::read(&mut sub)?)
-            }
-            ExtensionType::SupportedVersions => {
-                ClientExtension::SupportedVersions(ProtocolVersions::read(&mut sub)?)
-            }
-            ExtensionType::KeyShare => ClientExtension::KeyShare(KeyShareEntries::read(&mut sub)?),
-            ExtensionType::PSKKeyExchangeModes => {
-                ClientExtension::PresharedKeyModes(PSKKeyExchangeModes::read(&mut sub)?)
-            }
-            ExtensionType::PreSharedKey => {
-                ClientExtension::PresharedKey(PresharedKeyOffer::read(&mut sub)?)
-            }
-            ExtensionType::Cookie => ClientExtension::Cookie(PayloadU16::read(&mut sub)?),
-            ExtensionType::ExtendedMasterSecret if !sub.any_left() => {
-                ClientExtension::ExtendedMasterSecretRequest
-            }
-            ExtensionType::StatusRequest => {
-                let csr = CertificateStatusRequest::read(&mut sub)?;
-                ClientExtension::CertificateStatusRequest(csr)
-            }
-            ExtensionType::SCT if !sub.any_left() => {
-                ClientExtension::SignedCertificateTimestampRequest
-            }
-            ExtensionType::TransportParameters => {
-                ClientExtension::TransportParameters(sub.rest().to_vec())
-            }
-            ExtensionType::EarlyData if !sub.any_left() => ClientExtension::EarlyData,
-            _ => ClientExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
-    }
-}
-
-fn trim_hostname_trailing_dot_for_sni(dns_name: webpki::DNSNameRef) -> webpki::DNSName {
-    let dns_name_str: &str = dns_name.into();
-
-    // RFC6066: "The hostname is represented as a byte string using
-    // ASCII encoding without a trailing dot"
-    if dns_name_str.ends_with('.') {
-        let trimmed = &dns_name_str[0..dns_name_str.len() - 1];
-        webpki::DNSNameRef::try_from_ascii_str(trimmed)
-            .unwrap()
-            .to_owned()
-    } else {
-        dns_name.to_owned()
-    }
-}
-
-impl ClientExtension {
-    /// Make a basic SNI ServerNameRequest quoting `hostname`.
-    pub fn make_sni(dns_name: webpki::DNSNameRef) -> ClientExtension {
-        let name = ServerName {
-            typ: ServerNameType::HostName,
-            payload: ServerNamePayload::HostName(trim_hostname_trailing_dot_for_sni(dns_name)),
-        };
-
-        ClientExtension::ServerName(vec![name])
-    }
-}
-
-#[derive(Clone, Debug)]
-pub enum ServerExtension {
-    ECPointFormats(ECPointFormatList),
-    ServerNameAck,
-    SessionTicketAck,
-    RenegotiationInfo(PayloadU8),
-    Protocols(ProtocolNameList),
-    KeyShare(KeyShareEntry),
-    PresharedKey(u16),
-    ExtendedMasterSecretAck,
-    CertificateStatusAck,
-    SignedCertificateTimestamp(SCTList),
-    SupportedVersions(ProtocolVersion),
-    TransportParameters(Vec<u8>),
-    EarlyData,
-    Unknown(UnknownExtension),
-}
-
-impl ServerExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            ServerExtension::ECPointFormats(_) => ExtensionType::ECPointFormats,
-            ServerExtension::ServerNameAck => ExtensionType::ServerName,
-            ServerExtension::SessionTicketAck => ExtensionType::SessionTicket,
-            ServerExtension::RenegotiationInfo(_) => ExtensionType::RenegotiationInfo,
-            ServerExtension::Protocols(_) => ExtensionType::ALProtocolNegotiation,
-            ServerExtension::KeyShare(_) => ExtensionType::KeyShare,
-            ServerExtension::PresharedKey(_) => ExtensionType::PreSharedKey,
-            ServerExtension::ExtendedMasterSecretAck => ExtensionType::ExtendedMasterSecret,
-            ServerExtension::CertificateStatusAck => ExtensionType::StatusRequest,
-            ServerExtension::SignedCertificateTimestamp(_) => ExtensionType::SCT,
-            ServerExtension::SupportedVersions(_) => ExtensionType::SupportedVersions,
-            ServerExtension::TransportParameters(_) => ExtensionType::TransportParameters,
-            ServerExtension::EarlyData => ExtensionType::EarlyData,
-            ServerExtension::Unknown(ref r) => r.typ,
-        }
-    }
-}
-
-impl Codec for ServerExtension {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
-
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            ServerExtension::ECPointFormats(ref r) => r.encode(&mut sub),
-            ServerExtension::ServerNameAck
-            | ServerExtension::SessionTicketAck
-            | ServerExtension::ExtendedMasterSecretAck
-            | ServerExtension::CertificateStatusAck
-            | ServerExtension::EarlyData => {}
-            ServerExtension::RenegotiationInfo(ref r) => r.encode(&mut sub),
-            ServerExtension::Protocols(ref r) => r.encode(&mut sub),
-            ServerExtension::KeyShare(ref r) => r.encode(&mut sub),
-            ServerExtension::PresharedKey(r) => r.encode(&mut sub),
-            ServerExtension::SignedCertificateTimestamp(ref r) => r.encode(&mut sub),
-            ServerExtension::SupportedVersions(ref r) => r.encode(&mut sub),
-            ServerExtension::TransportParameters(ref r) => sub.extend_from_slice(r),
-            ServerExtension::Unknown(ref r) => r.encode(&mut sub),
-        }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
-    }
-
-    fn read(r: &mut Reader) -> Option<ServerExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
-        let mut sub = r.sub(len)?;
-
-        Some(match typ {
-            ExtensionType::ECPointFormats => {
-                ServerExtension::ECPointFormats(ECPointFormatList::read(&mut sub)?)
-            }
-            ExtensionType::ServerName => ServerExtension::ServerNameAck,
-            ExtensionType::SessionTicket => ServerExtension::SessionTicketAck,
-            ExtensionType::StatusRequest => ServerExtension::CertificateStatusAck,
-            ExtensionType::RenegotiationInfo => {
-                ServerExtension::RenegotiationInfo(PayloadU8::read(&mut sub)?)
-            }
-            ExtensionType::ALProtocolNegotiation => {
-                ServerExtension::Protocols(ProtocolNameList::read(&mut sub)?)
-            }
-            ExtensionType::KeyShare => ServerExtension::KeyShare(KeyShareEntry::read(&mut sub)?),
-            ExtensionType::PreSharedKey => ServerExtension::PresharedKey(u16::read(&mut sub)?),
-            ExtensionType::ExtendedMasterSecret => ServerExtension::ExtendedMasterSecretAck,
-            ExtensionType::SCT => {
-                let scts = SCTList::read(&mut sub)?;
-                ServerExtension::SignedCertificateTimestamp(scts)
-            }
-            ExtensionType::SupportedVersions => {
-                ServerExtension::SupportedVersions(ProtocolVersion::read(&mut sub)?)
-            }
-            ExtensionType::TransportParameters => {
-                ServerExtension::TransportParameters(sub.rest().to_vec())
-            }
-            ExtensionType::EarlyData => ServerExtension::EarlyData,
-            _ => ServerExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
-    }
-}
-
-impl ServerExtension {
-    pub fn make_alpn(proto: &[&[u8]]) -> ServerExtension {
-        ServerExtension::Protocols(ProtocolNameList::from_slices(proto))
-    }
-
-    pub fn make_empty_renegotiation_info() -> ServerExtension {
-        let empty = Vec::new();
-        ServerExtension::RenegotiationInfo(PayloadU8::new(empty))
-    }
-
-    pub fn make_sct(sctl: Vec<u8>) -> ServerExtension {
-        let scts = SCTList::read_bytes(&sctl).expect("invalid SCT list");
-        ServerExtension::SignedCertificateTimestamp(scts)
-    }
-}
-
-#[derive(Debug)]
-pub struct ClientHelloPayload {
-    pub client_version: ProtocolVersion,
-    pub random: Random,
-    pub session_id: SessionID,
-    pub cipher_suites: Vec<CipherSuite>,
-    pub compression_methods: Vec<Compression>,
-    pub extensions: Vec<ClientExtension>,
-}
-
-impl Codec for ClientHelloPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.client_version.encode(bytes);
-        self.random.encode(bytes);
-        self.session_id.encode(bytes);
-        codec::encode_vec_u16(bytes, &self.cipher_suites);
-        codec::encode_vec_u8(bytes, &self.compression_methods);
-
-        if !self.extensions.is_empty() {
-            codec::encode_vec_u16(bytes, &self.extensions);
-        }
-    }
-
-    fn read(r: &mut Reader) -> Option<ClientHelloPayload> {
-        let mut ret = ClientHelloPayload {
-            client_version: ProtocolVersion::read(r)?,
-            random: Random::read(r)?,
-            session_id: SessionID::read(r)?,
-            cipher_suites: codec::read_vec_u16::<CipherSuite>(r)?,
-            compression_methods: codec::read_vec_u8::<Compression>(r)?,
-            extensions: Vec::new(),
-        };
-
-        if r.any_left() {
-            ret.extensions = codec::read_vec_u16::<ClientExtension>(r)?;
-        }
-
-        Some(ret)
-    }
-}
-
-impl ClientHelloPayload {
-    /// Returns true if there is more than one extension of a given
-    /// type.
-    pub fn has_duplicate_extension(&self) -> bool {
-        let mut seen = collections::HashSet::new();
-
-        for ext in &self.extensions {
-            let typ = ext.get_type().get_u16();
-
-            if seen.contains(&typ) {
-                return true;
-            }
-            seen.insert(typ);
-        }
-
         false
     }
 
-    pub fn find_extension(&self, ext: ExtensionType) -> Option<&ClientExtension> {
-        self.extensions
-            .iter()
-            .find(|x| x.get_type() == ext)
-    }
-
-    pub fn get_sni_extension(&self) -> Option<&ServerNameRequest> {
-        let ext = self.find_extension(ExtensionType::ServerName)?;
-        match *ext {
-            ClientExtension::ServerName(ref req) => Some(req),
-            _ => None,
-        }
-    }
-
-    pub fn get_sigalgs_extension(&self) -> Option<&SupportedSignatureSchemes> {
-        let ext = self.find_extension(ExtensionType::SignatureAlgorithms)?;
-        match *ext {
-            ClientExtension::SignatureAlgorithms(ref req) => Some(req),
-            _ => None,
-        }
-    }
-
-    pub fn get_namedgroups_extension(&self) -> Option<&NamedGroups> {
-        let ext = self.find_extension(ExtensionType::EllipticCurves)?;
-        match *ext {
-            ClientExtension::NamedGroups(ref req) => Some(req),
-            _ => None,
-        }
-    }
-
-    pub fn get_ecpoints_extension(&self) -> Option<&ECPointFormatList> {
-        let ext = self.find_extension(ExtensionType::ECPointFormats)?;
-        match *ext {
-            ClientExtension::ECPointFormats(ref req) => Some(req),
-            _ => None,
-        }
-    }
-
-    pub fn get_alpn_extension(&self) -> Option<&ProtocolNameList> {
-        let ext = self.find_extension(ExtensionType::ALProtocolNegotiation)?;
-        match *ext {
-            ClientExtension::Protocols(ref req) => Some(req),
-            _ => None,
-        }
-    }
-
-    pub fn get_quic_params_extension(&self) -> Option<Vec<u8>> {
-        let ext = self.find_extension(ExtensionType::TransportParameters)?;
-        match *ext {
-            ClientExtension::TransportParameters(ref bytes) => Some(bytes.to_vec()),
-            _ => None,
-        }
-    }
-
-    pub fn get_ticket_extension(&self) -> Option<&ClientExtension> {
-        self.find_extension(ExtensionType::SessionTicket)
-    }
-
-    pub fn get_versions_extension(&self) -> Option<&ProtocolVersions> {
-        let ext = self.find_extension(ExtensionType::SupportedVersions)?;
-        match *ext {
-            ClientExtension::SupportedVersions(ref vers) => Some(vers),
-            _ => None,
-        }
-    }
-
-    pub fn get_keyshare_extension(&self) -> Option<&KeyShareEntries> {
-        let ext = self.find_extension(ExtensionType::KeyShare)?;
-        match *ext {
-            ClientExtension::KeyShare(ref shares) => Some(shares),
-            _ => None,
-        }
-    }
-
-    pub fn has_keyshare_extension_with_duplicates(&self) -> bool {
-        if let Some(entries) = self.get_keyshare_extension() {
-            let mut seen = collections::HashSet::new();
-            
-            for kse in entries {
-                let grp = kse.group.get_u16();
-    
-                if !seen.insert(grp) {
-                    return true;
-                }
-            }
-        }
-
-        false
-    }
-
-    pub fn get_psk(&self) -> Option<&PresharedKeyOffer> {
-        let ext = self.find_extension(ExtensionType::PreSharedKey)?;
-        match *ext {
-            ClientExtension::PresharedKey(ref psk) => Some(psk),
-            _ => None,
-        }
-    }
-
-    pub fn check_psk_ext_is_last(&self) -> bool {
-        self.extensions
-            .last()
-            .map_or(false, |ext| ext.get_type() == ExtensionType::PreSharedKey)
-    }
-
-    pub fn get_psk_modes(&self) -> Option<&PSKKeyExchangeModes> {
-        let ext = self.find_extension(ExtensionType::PSKKeyExchangeModes)?;
-        match *ext {
-            ClientExtension::PresharedKeyModes(ref psk_modes) => Some(psk_modes),
-            _ => None,
-        }
-    }
-
-    pub fn psk_mode_offered(&self, mode: PSKKeyExchangeMode) -> bool {
-        self.get_psk_modes()
-            .map(|modes| modes.contains(&mode))
-            .or(Some(false))
-            .unwrap()
-    }
-
-
-    pub fn set_psk_binder(&mut self, binder: impl Into<Vec<u8>>) {
-        let last_extension = self.extensions.last_mut().unwrap();
-        if let ClientExtension::PresharedKey(ref mut offer) = *last_extension {
-            offer.binders[0] = PresharedKeyBinder::new(binder.into());
-        }
-    }
-
-    pub fn ems_support_offered(&self) -> bool {
-        self.find_extension(ExtensionType::ExtendedMasterSecret)
-            .is_some()
-    }
-
-    pub fn early_data_extension_offered(&self) -> bool {
-        self.find_extension(ExtensionType::EarlyData)
-            .is_some()
-    }
+    const LIST_LENGTH: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
+    };
 }
 
-#[derive(Debug)]
-pub enum HelloRetryExtension {
-    KeyShare(NamedGroup),
-    Cookie(PayloadU16),
-    SupportedVersions(ProtocolVersion),
-    Unknown(UnknownExtension),
-}
-
-impl HelloRetryExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            HelloRetryExtension::KeyShare(_) => ExtensionType::KeyShare,
-            HelloRetryExtension::Cookie(_) => ExtensionType::Cookie,
-            HelloRetryExtension::SupportedVersions(_) => ExtensionType::SupportedVersions,
-            HelloRetryExtension::Unknown(ref r) => r.typ,
-        }
-    }
-}
-
-impl Codec for HelloRetryExtension {
+impl Codec<'_> for SupportedProtocolVersions {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
-
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            HelloRetryExtension::KeyShare(ref r) => r.encode(&mut sub),
-            HelloRetryExtension::Cookie(ref r) => r.encode(&mut sub),
-            HelloRetryExtension::SupportedVersions(ref r) => r.encode(&mut sub),
-            HelloRetryExtension::Unknown(ref r) => r.encode(&mut sub),
+        let inner = LengthPrefixedBuffer::new(Self::LIST_LENGTH, bytes);
+        if self.tls13 {
+            ProtocolVersion::TLSv1_3.encode(inner.buf);
         }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
+        if self.tls12 {
+            ProtocolVersion::TLSv1_2.encode(inner.buf);
+        }
     }
 
-    fn read(r: &mut Reader) -> Option<HelloRetryExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
+    fn read(reader: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let mut tls12 = false;
+        let mut tls13 = false;
+
+        for pv in TlsListIter::<ProtocolVersion>::new(reader)? {
+            match pv? {
+                ProtocolVersion::TLSv1_3 => tls13 = true,
+                ProtocolVersion::TLSv1_2 => tls12 = true,
+                _ => continue,
+            };
+        }
+
+        Ok(Self { tls13, tls12 })
+    }
+}
+
+impl TlsListElement for ProtocolVersion {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("ProtocolVersions"),
+    };
+}
+
+/// RFC 7250: `CertificateType client_certificate_types<1..2^8-1>;`
+///
+/// Ditto `CertificateType server_certificate_types<1..2^8-1>;`
+impl TlsListElement for CertificateType {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("CertificateTypes"),
+    };
+}
+
+/// RFC 8879: `CertificateCompressionAlgorithm algorithms<2..2^8-2>;`
+impl TlsListElement for CertificateCompressionAlgorithm {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("CertificateCompressionAlgorithms"),
+    };
+}
+
+/// A precursor to `ClientExtensions`, allowing customisation.
+///
+/// This is smaller than `ClientExtensions`, as it only contains the extensions
+/// we need to vary between different protocols (eg, TCP-TLS versus QUIC).
+#[derive(Clone, Default)]
+pub(crate) struct ClientExtensionsInput {
+    /// QUIC transport parameters
+    pub(crate) transport_parameters: Option<TransportParameters>,
+
+    /// ALPN protocols
+    pub(crate) protocols: Option<Vec<ApplicationProtocol<'static>>>,
+}
+
+impl ClientExtensionsInput {
+    pub(crate) fn from_alpn(alpn_protocols: Vec<ApplicationProtocol<'static>>) -> Self {
+        let protocols = match alpn_protocols.is_empty() {
+            true => None,
+            false => Some(alpn_protocols),
+        };
+
+        Self {
+            transport_parameters: None,
+            protocols,
+        }
+    }
+}
+
+#[derive(Clone)]
+pub(crate) enum TransportParameters {
+    /// QUIC transport parameters (RFC 9001)
+    Quic(Payload<'static>),
+}
+
+#[derive(Default)]
+pub(crate) struct ServerExtensionsInput {
+    /// QUIC transport parameters
+    pub(crate) transport_parameters: Option<TransportParameters>,
+}
+
+/// RFC 9846: `CipherSuite cipher_suites<2..2^16-2>;`
+impl TlsListElement for CipherSuite {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU16 {
+        empty_error: InvalidMessage::IllegalEmptyList("CipherSuites"),
+    };
+}
+
+/// RFC 5246: `CompressionMethod compression_methods<1..2^8-1>;`
+impl TlsListElement for Compression {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("Compressions"),
+    };
+}
+
+/// RFC 9849: `ExtensionType OuterExtensions<2..254>;`
+impl TlsListElement for ExtensionType {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("ExtensionTypes"),
+    };
+}
+
+extension_struct! {
+    /// A representation of extensions present in a `HelloRetryRequest` message
+    pub(crate) struct HelloRetryRequestExtensions<'a> {
+        ExtensionType::KeyShare =>
+            pub(crate) key_share: Option<NamedGroup>,
+
+        ExtensionType::Cookie =>
+            pub(crate) cookie: Option<SizedPayload<'a, u16, NonEmpty>>,
+
+        ExtensionType::SupportedVersions =>
+            pub(crate) supported_versions: Option<ProtocolVersion>,
+
+        ExtensionType::EncryptedClientHello =>
+            pub(crate) encrypted_client_hello: Option<Payload<'a>>,
+    } + {
+        /// Records decoding order of records, and controls encoding order.
+        pub(crate) order: Option<Vec<ExtensionType>>,
+    }
+}
+
+impl HelloRetryRequestExtensions<'_> {
+    fn into_owned(self) -> HelloRetryRequestExtensions<'static> {
+        let Self {
+            key_share,
+            cookie,
+            supported_versions,
+            encrypted_client_hello,
+            order,
+        } = self;
+        HelloRetryRequestExtensions {
+            key_share,
+            cookie: cookie.map(|x| x.into_owned()),
+            supported_versions,
+            encrypted_client_hello: encrypted_client_hello.map(|x| x.into_owned()),
+            order,
+        }
+    }
+}
+
+impl<'a> Codec<'a> for HelloRetryRequestExtensions<'a> {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
+
+        for ext in self
+            .order
+            .as_deref()
+            .unwrap_or(Self::ALL_EXTENSIONS)
+        {
+            self.encode_one(*ext, extensions.buf);
+        }
+    }
+
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        let mut out = Self::default();
+
+        // we must record order, so re-encoding round trips.  this is needed,
+        // unfortunately, for ECH HRR confirmation
+        let mut order = vec![];
+
+        let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
-        Some(match typ {
-            ExtensionType::KeyShare => HelloRetryExtension::KeyShare(NamedGroup::read(&mut sub)?),
-            ExtensionType::Cookie => HelloRetryExtension::Cookie(PayloadU16::read(&mut sub)?),
-            ExtensionType::SupportedVersions => {
-                HelloRetryExtension::SupportedVersions(ProtocolVersion::read(&mut sub)?)
-            }
-            _ => HelloRetryExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
+        while sub.any_left() {
+            let typ = out.read_one(&mut sub, |_unk| {
+                Err(InvalidMessage::UnknownHelloRetryRequestExtension)
+            })?;
+
+            order.push(typ);
+        }
+
+        out.order = Some(order);
+        Ok(out)
     }
 }
 
-#[derive(Debug)]
-pub struct HelloRetryRequest {
-    pub legacy_version: ProtocolVersion,
-    pub session_id: SessionID,
-    pub cipher_suite: CipherSuite,
-    pub extensions: Vec<HelloRetryExtension>,
+#[derive(Clone, Debug)]
+pub(crate) struct HelloRetryRequest {
+    pub(crate) legacy_version: ProtocolVersion,
+    pub(crate) session_id: SessionId,
+    pub(crate) cipher_suite: CipherSuite,
+    pub(crate) extensions: HelloRetryRequestExtensions<'static>,
 }
 
-impl Codec for HelloRetryRequest {
+impl Codec<'_> for HelloRetryRequest {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.legacy_version.encode(bytes);
-        HELLO_RETRY_REQUEST_RANDOM.encode(bytes);
-        self.session_id.encode(bytes);
-        self.cipher_suite.encode(bytes);
-        Compression::Null.encode(bytes);
-        codec::encode_vec_u16(bytes, &self.extensions);
+        self.payload_encode(bytes, Encoding::Standard)
     }
 
-    fn read(r: &mut Reader) -> Option<HelloRetryRequest> {
-        let session_id = SessionID::read(r)?;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let session_id = SessionId::read(r)?;
         let cipher_suite = CipherSuite::read(r)?;
         let compression = Compression::read(r)?;
 
         if compression != Compression::Null {
-            return None;
+            return Err(InvalidMessage::UnsupportedCompression);
         }
 
-        Some(HelloRetryRequest {
-            legacy_version: ProtocolVersion::Unknown(0),
+        Ok(Self {
+            legacy_version: ProtocolVersion(0),
             session_id,
             cipher_suite,
-            extensions: codec::read_vec_u16::<HelloRetryExtension>(r)?,
+            extensions: HelloRetryRequestExtensions::read(r)?.into_owned(),
         })
     }
 }
 
 impl HelloRetryRequest {
-    /// Returns true if there is more than one extension of a given
-    /// type.
-    pub fn has_duplicate_extension(&self) -> bool {
-        let mut seen = collections::HashSet::new();
-
-        for ext in &self.extensions {
-            let typ = ext.get_type().get_u16();
-
-            if seen.contains(&typ) {
-                return true;
-            }
-            seen.insert(typ);
-        }
-
-        false
-    }
-
-    pub fn has_unknown_extension(&self) -> bool {
-        self.extensions.iter().any(|ext| {
-            ext.get_type() != ExtensionType::KeyShare
-                && ext.get_type() != ExtensionType::SupportedVersions
-                && ext.get_type() != ExtensionType::Cookie
-        })
-    }
-
-    fn find_extension(&self, ext: ExtensionType) -> Option<&HelloRetryExtension> {
-        self.extensions
-            .iter()
-            .find(|x| x.get_type() == ext)
-    }
-
-    pub fn get_requested_key_share_group(&self) -> Option<NamedGroup> {
-        let ext = self.find_extension(ExtensionType::KeyShare)?;
-        match *ext {
-            HelloRetryExtension::KeyShare(grp) => Some(grp),
-            _ => None,
-        }
-    }
-
-    pub fn get_cookie(&self) -> Option<&PayloadU16> {
-        let ext = self.find_extension(ExtensionType::Cookie)?;
-        match *ext {
-            HelloRetryExtension::Cookie(ref ck) => Some(ck),
-            _ => None,
-        }
-    }
-
-    pub fn get_supported_versions(&self) -> Option<ProtocolVersion> {
-        let ext = self.find_extension(ExtensionType::SupportedVersions)?;
-        match *ext {
-            HelloRetryExtension::SupportedVersions(ver) => Some(ver),
-            _ => None,
-        }
-    }
-}
-
-#[derive(Debug)]
-pub struct ServerHelloPayload {
-    pub legacy_version: ProtocolVersion,
-    pub random: Random,
-    pub session_id: SessionID,
-    pub cipher_suite: CipherSuite,
-    pub compression_method: Compression,
-    pub extensions: Vec<ServerExtension>,
-}
-
-impl Codec for ServerHelloPayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
+    pub(super) fn payload_encode(&self, bytes: &mut Vec<u8>, purpose: Encoding) {
         self.legacy_version.encode(bytes);
-        self.random.encode(bytes);
-
+        HELLO_RETRY_REQUEST_RANDOM.encode(bytes);
         self.session_id.encode(bytes);
         self.cipher_suite.encode(bytes);
-        self.compression_method.encode(bytes);
+        Compression::Null.encode(bytes);
 
-        if !self.extensions.is_empty() {
-            codec::encode_vec_u16(bytes, &self.extensions);
+        match purpose {
+            // For the purpose of ECH confirmation, the Encrypted Client Hello extension
+            // must have its payload replaced by 8 zero bytes.
+            //
+            // See RFC 9849 7.2.1:
+            // <https://www.rfc-editor.org/info/rfc9849#name-sending-helloretryrequest>
+            Encoding::EchConfirmation
+                if self
+                    .extensions
+                    .encrypted_client_hello
+                    .is_some() =>
+            {
+                let hrr_confirmation = [0u8; 8];
+                HelloRetryRequestExtensions {
+                    encrypted_client_hello: Some(Payload::Borrowed(&hrr_confirmation)),
+                    ..self.extensions.clone()
+                }
+                .encode(bytes);
+            }
+            _ => self.extensions.encode(bytes),
         }
-    }
-
-    // minus version and random, which have already been read.
-    fn read(r: &mut Reader) -> Option<ServerHelloPayload> {
-        let session_id = SessionID::read(r)?;
-        let suite = CipherSuite::read(r)?;
-        let compression = Compression::read(r)?;
-
-        let mut ret = ServerHelloPayload {
-            legacy_version: ProtocolVersion::Unknown(0),
-            random: ZERO_RANDOM.clone(),
-            session_id,
-            cipher_suite: suite,
-            compression_method: compression,
-            extensions: Vec::new(),
-        };
-
-        if r.any_left() {
-            ret.extensions = codec::read_vec_u16::<ServerExtension>(r)?;
-        }
-
-        Some(ret)
     }
 }
 
-impl HasServerExtensions for ServerHelloPayload {
-    fn get_extensions(&self) -> &[ServerExtension] {
+impl Deref for HelloRetryRequest {
+    type Target = HelloRetryRequestExtensions<'static>;
+    fn deref(&self) -> &Self::Target {
         &self.extensions
     }
 }
 
-impl ServerHelloPayload {
-    pub fn get_key_share(&self) -> Option<&KeyShareEntry> {
-        let ext = self.find_extension(ExtensionType::KeyShare)?;
-        match *ext {
-            ServerExtension::KeyShare(ref share) => Some(share),
-            _ => None,
-        }
-    }
-
-    pub fn get_psk_index(&self) -> Option<u16> {
-        let ext = self.find_extension(ExtensionType::PreSharedKey)?;
-        match *ext {
-            ServerExtension::PresharedKey(ref index) => Some(*index),
-            _ => None,
-        }
-    }
-
-    pub fn get_ecpoints_extension(&self) -> Option<&ECPointFormatList> {
-        let ext = self.find_extension(ExtensionType::ECPointFormats)?;
-        match *ext {
-            ServerExtension::ECPointFormats(ref fmts) => Some(fmts),
-            _ => None,
-        }
-    }
-
-    pub fn ems_support_acked(&self) -> bool {
-        self.find_extension(ExtensionType::ExtendedMasterSecret)
-            .is_some()
-    }
-
-    pub fn get_sct_list(&self) -> Option<&SCTList> {
-        let ext = self.find_extension(ExtensionType::SCT)?;
-        match *ext {
-            ServerExtension::SignedCertificateTimestamp(ref sctl) => Some(sctl),
-            _ => None,
-        }
-    }
-
-    pub fn get_supported_versions(&self) -> Option<ProtocolVersion> {
-        let ext = self.find_extension(ExtensionType::SupportedVersions)?;
-        match *ext {
-            ServerExtension::SupportedVersions(vers) => Some(vers),
-            _ => None,
-        }
+impl DerefMut for HelloRetryRequest {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.extensions
     }
 }
 
-pub type CertificatePayload = Vec<key::Certificate>;
+#[derive(Clone, Default, Debug)]
+pub(crate) struct CertificateChain<'a>(pub(crate) Vec<CertificateDer<'a>>);
 
-impl Codec for CertificatePayload {
+impl<'a> CertificateChain<'a> {
+    pub(crate) fn from_signer(signer: &'a SelectedCredential) -> Self {
+        Self(
+            signer
+                .identity
+                .as_certificates()
+                .collect(),
+        )
+    }
+
+    pub(crate) fn into_owned(self) -> CertificateChain<'static> {
+        CertificateChain(
+            self.0
+                .into_iter()
+                .map(CertificateDer::into_owned)
+                .collect(),
+        )
+    }
+}
+
+impl<'a> Codec<'a> for CertificateChain<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        codec::encode_vec_u24(bytes, self);
+        Vec::encode(&self.0, bytes)
     }
 
-    fn read(r: &mut Reader) -> Option<CertificatePayload> {
-        // 64KB of certificates is plenty, 16MB is obviously silly
-        codec::read_vec_u24_limited(r, 0x10000)
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        let mut ret = Vec::new();
+        for item in TlsListIter::<CertificateDer<'a>>::new(r)? {
+            ret.push(item?);
+        }
+
+        Ok(Self(ret))
     }
 }
 
-// TLS1.3 changes the Certificate payload encoding.
-// That's annoying. It means the parsing is not
-// context-free any more.
+impl<'a> Deref for CertificateChain<'a> {
+    type Target = [CertificateDer<'a>];
 
-#[derive(Debug)]
-pub enum CertificateExtension {
-    CertificateStatus(CertificateStatus),
-    SignedCertificateTimestamp(SCTList),
-    Unknown(UnknownExtension),
+    fn deref(&self) -> &[CertificateDer<'a>] {
+        &self.0
+    }
 }
 
-impl CertificateExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            CertificateExtension::CertificateStatus(_) => ExtensionType::StatusRequest,
-            CertificateExtension::SignedCertificateTimestamp(_) => ExtensionType::SCT,
-            CertificateExtension::Unknown(ref r) => r.typ,
-        }
+extension_struct! {
+    pub(crate) struct CertificateExtensions<'a> {
+        ExtensionType::StatusRequest =>
+            pub(crate) status: Option<CertificateStatus<'a>>,
     }
+}
 
-    pub fn make_sct(sct_list: Vec<u8>) -> CertificateExtension {
-        let sctl = SCTList::read_bytes(&sct_list).expect("invalid SCT list");
-        CertificateExtension::SignedCertificateTimestamp(sctl)
-    }
-
-    pub fn get_cert_status(&self) -> Option<&Vec<u8>> {
-        match *self {
-            CertificateExtension::CertificateStatus(ref cs) => Some(&cs.ocsp_response.0),
-            _ => None,
-        }
-    }
-
-    pub fn get_sct_list(&self) -> Option<&SCTList> {
-        match *self {
-            CertificateExtension::SignedCertificateTimestamp(ref sctl) => Some(sctl),
-            _ => None,
+impl CertificateExtensions<'_> {
+    fn into_owned(self) -> CertificateExtensions<'static> {
+        CertificateExtensions {
+            status: self.status.map(|s| s.into_owned()),
         }
     }
 }
 
-impl Codec for CertificateExtension {
+impl<'a> Codec<'a> for CertificateExtensions<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
+        let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            CertificateExtension::CertificateStatus(ref r) => r.encode(&mut sub),
-            CertificateExtension::SignedCertificateTimestamp(ref r) => r.encode(&mut sub),
-            CertificateExtension::Unknown(ref r) => r.encode(&mut sub),
+        for ext in Self::ALL_EXTENSIONS {
+            self.encode_one(*ext, extensions.buf);
         }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificateExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        let mut out = Self::default();
+
+        let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
-        Some(match typ {
-            ExtensionType::StatusRequest => {
-                let st = CertificateStatus::read(&mut sub)?;
-                CertificateExtension::CertificateStatus(st)
-            }
-            ExtensionType::SCT => {
-                let scts = SCTList::read(&mut sub)?;
-                CertificateExtension::SignedCertificateTimestamp(scts)
-            }
-            _ => CertificateExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
+        while sub.any_left() {
+            out.read_one(&mut sub, |_unk| {
+                Err(InvalidMessage::UnknownCertificateExtension)
+            })?;
+        }
+
+        Ok(out)
     }
 }
 
-declare_u16_vec!(CertificateExtensions, CertificateExtension);
-
 #[derive(Debug)]
-pub struct CertificateEntry {
-    pub cert: key::Certificate,
-    pub exts: CertificateExtensions,
+pub(crate) struct CertificateEntry<'a> {
+    pub(crate) cert: CertificateDer<'a>,
+    pub(crate) extensions: CertificateExtensions<'a>,
 }
 
-impl Codec for CertificateEntry {
+impl<'a> Codec<'a> for CertificateEntry<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.cert.encode(bytes);
-        self.exts.encode(bytes);
+        self.extensions.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificateEntry> {
-        Some(CertificateEntry {
-            cert: key::Certificate::read(r)?,
-            exts: CertificateExtensions::read(r)?,
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            cert: CertificateDer::read(r)?,
+            extensions: CertificateExtensions::read(r)?.into_owned(),
         })
     }
 }
 
-impl CertificateEntry {
-    pub fn new(cert: key::Certificate) -> CertificateEntry {
-        CertificateEntry {
+impl<'a> CertificateEntry<'a> {
+    pub(crate) fn new(cert: CertificateDer<'a>) -> Self {
+        Self {
             cert,
-            exts: Vec::new(),
+            extensions: CertificateExtensions::default(),
         }
     }
 
-    pub fn has_duplicate_extension(&self) -> bool {
-        let mut seen = collections::HashSet::new();
-
-        for ext in &self.exts {
-            let typ = ext.get_type().get_u16();
-
-            if seen.contains(&typ) {
-                return true;
-            }
-            seen.insert(typ);
+    fn into_owned(self) -> CertificateEntry<'static> {
+        CertificateEntry {
+            cert: self.cert.into_owned(),
+            extensions: self.extensions.into_owned(),
         }
-
-        false
     }
+}
 
-    pub fn has_unknown_extension(&self) -> bool {
-        self.exts.iter().any(|ext| {
-            ext.get_type() != ExtensionType::StatusRequest && ext.get_type() != ExtensionType::SCT
-        })
-    }
-
-    pub fn get_ocsp_response(&self) -> Option<&Vec<u8>> {
-        self.exts
-            .iter()
-            .find(|ext| ext.get_type() == ExtensionType::StatusRequest)
-            .and_then(CertificateExtension::get_cert_status)
-    }
-
-    pub fn get_scts(&self) -> Option<&SCTList> {
-        self.exts
-            .iter()
-            .find(|ext| ext.get_type() == ExtensionType::SCT)
-            .and_then(CertificateExtension::get_sct_list)
-    }
+impl TlsListElement for CertificateEntry<'_> {
+    const SIZE_LEN: ListLength = ListLength::U24 {
+        max: CERTIFICATE_MAX_SIZE_LIMIT,
+        error: InvalidMessage::CertificatePayloadTooLarge,
+    };
 }
 
 #[derive(Debug)]
-pub struct CertificatePayloadTLS13 {
-    pub context: PayloadU8,
-    pub entries: Vec<CertificateEntry>,
+pub(crate) struct CertificatePayloadTls13<'a> {
+    pub(crate) context: SizedPayload<'a, u8>,
+    pub(crate) entries: Vec<CertificateEntry<'a>>,
 }
 
-impl Codec for CertificatePayloadTLS13 {
+impl<'a> CertificatePayloadTls13<'a> {
+    pub(crate) fn new(
+        certs: impl Iterator<Item = CertificateDer<'a>>,
+        ocsp_response: Option<&'a [u8]>,
+    ) -> Self {
+        let ocsp_response = match ocsp_response {
+            Some([]) | None => None,
+            Some(bytes) => Some(bytes),
+        };
+
+        Self {
+            context: SizedPayload::from(Payload::Borrowed(&[])),
+            entries: certs
+                // zip certificate iterator with `ocsp_response` followed by
+                // an infinite-length iterator of `None`.
+                .zip(
+                    ocsp_response
+                        .into_iter()
+                        .map(Some)
+                        .chain(iter::repeat(None)),
+                )
+                .map(|(cert, ocsp)| {
+                    let mut e = CertificateEntry::new(cert);
+                    if let Some(ocsp) = ocsp {
+                        e.extensions.status = Some(CertificateStatus::new(ocsp));
+                    }
+                    e
+                })
+                .collect(),
+        }
+    }
+
+    pub(super) fn into_owned(self) -> CertificatePayloadTls13<'static> {
+        CertificatePayloadTls13 {
+            context: self.context.into_owned(),
+            entries: self
+                .entries
+                .into_iter()
+                .map(CertificateEntry::into_owned)
+                .collect(),
+        }
+    }
+
+    pub(crate) fn end_entity_ocsp(&self) -> Vec<u8> {
+        let Some(entry) = self.entries.first() else {
+            return vec![];
+        };
+        entry
+            .extensions
+            .status
+            .as_ref()
+            .map(|status| status.ocsp_response.to_vec())
+            .unwrap_or_default()
+    }
+
+    pub(crate) fn into_certificate_chain(self) -> CertificateChain<'a> {
+        CertificateChain(
+            self.entries
+                .into_iter()
+                .map(|e| e.cert)
+                .collect(),
+        )
+    }
+
+    pub(super) const TYPICAL_LEN: usize = 2048;
+}
+
+impl<'a> Codec<'a> for CertificatePayloadTls13<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.context.encode(bytes);
-        codec::encode_vec_u24(bytes, &self.entries);
+        self.entries.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificatePayloadTLS13> {
-        Some(CertificatePayloadTLS13 {
-            context: PayloadU8::read(r)?,
-            entries: codec::read_vec_u24_limited::<CertificateEntry>(r, 0x10000)?,
+    fn size_hint(&self) -> Option<usize> {
+        Some(Self::TYPICAL_LEN)
+    }
+
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            context: SizedPayload::read(r)?.into_owned(),
+            entries: Vec::read(r)?,
         })
     }
 }
 
-impl CertificatePayloadTLS13 {
-    pub fn new(entries: Vec<CertificateEntry>) -> CertificatePayloadTLS13 {
-        CertificatePayloadTLS13 {
-            context: PayloadU8::empty(),
-            entries,
-        }
-    }
-
-    pub fn any_entry_has_duplicate_extension(&self) -> bool {
-        for entry in &self.entries {
-            if entry.has_duplicate_extension() {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    pub fn any_entry_has_unknown_extension(&self) -> bool {
-        for entry in &self.entries {
-            if entry.has_unknown_extension() {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    pub fn any_entry_has_extension(&self) -> bool {
-        for entry in &self.entries {
-            if !entry.exts.is_empty() {
-                return true;
-            }
-        }
-
-        false
-    }
-
-    pub fn get_end_entity_ocsp(&self) -> Vec<u8> {
-        self.entries
-            .first()
-            .and_then(CertificateEntry::get_ocsp_response)
-            .cloned()
-            .unwrap_or_else(Vec::new)
-    }
-
-    pub fn get_end_entity_scts(&self) -> Option<SCTList> {
-        self.entries
-            .first()
-            .and_then(CertificateEntry::get_scts)
-            .cloned()
-    }
-
-    pub fn convert(&self) -> CertificatePayload {
-        let mut ret = Vec::new();
-        for entry in &self.entries {
-            ret.push(entry.cert.clone());
-        }
-        ret
-    }
-}
-
-#[derive(Debug)]
-pub enum KeyExchangeAlgorithm {
-    BulkOnly,
-    DH,
-    DHE,
-    RSA,
-    ECDH,
-    ECDHE,
-}
+pub(crate) static ALL_KEY_EXCHANGE_ALGORITHMS: &[KeyExchangeAlgorithm] =
+    &[KeyExchangeAlgorithm::ECDHE, KeyExchangeAlgorithm::DHE];
 
 // We don't support arbitrary curves.  It's a terrible
 // idea and unnecessary attack surface.  Please,
 // get a grip.
 #[derive(Debug)]
-pub struct ECParameters {
-    pub curve_type: ECCurveType,
-    pub named_group: NamedGroup,
+pub(crate) struct EcParameters {
+    pub(crate) curve_type: ECCurveType,
+    pub(crate) named_group: NamedGroup,
 }
 
-impl Codec for ECParameters {
+impl Codec<'_> for EcParameters {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.curve_type.encode(bytes);
         self.named_group.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<ECParameters> {
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         let ct = ECCurveType::read(r)?;
-
         if ct != ECCurveType::NamedCurve {
-            return None;
+            return Err(InvalidMessage::UnsupportedCurveType);
         }
 
         let grp = NamedGroup::read(r)?;
 
-        Some(ECParameters {
+        Ok(Self {
             curve_type: ct,
             named_group: grp,
         })
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct DigitallySignedStruct {
-    pub scheme: SignatureScheme,
-    pub sig: PayloadU16,
+pub(crate) trait KxDecode<'a>: Sized {
+    /// Decode a key exchange message given the key_exchange `algo`
+    fn decode(r: &mut Reader<'a>, algo: KeyExchangeAlgorithm) -> Result<Self, InvalidMessage>;
 }
 
-impl DigitallySignedStruct {
-    pub fn new(scheme: SignatureScheme, sig: Vec<u8>) -> DigitallySignedStruct {
-        DigitallySignedStruct {
-            scheme,
-            sig: PayloadU16::new(sig),
+pub(crate) enum ClientKeyExchangeParams {
+    Ecdh(ClientEcdhParams),
+    Dh(ClientDhParams),
+}
+
+impl ClientKeyExchangeParams {
+    pub(crate) fn pub_key(&self) -> &[u8] {
+        match self {
+            Self::Ecdh(ecdh) => ecdh.public.bytes(),
+            Self::Dh(dh) => dh.public.bytes(),
+        }
+    }
+
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Ecdh(ecdh) => ecdh.encode(buf),
+            Self::Dh(dh) => dh.encode(buf),
         }
     }
 }
 
-impl Codec for DigitallySignedStruct {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.scheme.encode(bytes);
-        self.sig.encode(bytes);
-    }
-
-    fn read(r: &mut Reader) -> Option<DigitallySignedStruct> {
-        let scheme = SignatureScheme::read(r)?;
-        let sig = PayloadU16::read(r)?;
-
-        Some(DigitallySignedStruct { scheme, sig })
+impl KxDecode<'_> for ClientKeyExchangeParams {
+    fn decode(r: &mut Reader<'_>, algo: KeyExchangeAlgorithm) -> Result<Self, InvalidMessage> {
+        use KeyExchangeAlgorithm::*;
+        Ok(match algo {
+            ECDHE => Self::Ecdh(ClientEcdhParams::read(r)?),
+            DHE => Self::Dh(ClientDhParams::read(r)?),
+        })
     }
 }
 
-#[derive(Debug)]
-pub struct ClientECDHParams {
-    pub public: PayloadU8,
+pub(crate) struct ClientEcdhParams {
+    /// RFC 4492: `opaque point <1..2^8-1>;`
+    pub(crate) public: SizedPayload<'static, u8, NonEmpty>,
 }
 
-impl Codec for ClientECDHParams {
+impl Codec<'_> for ClientEcdhParams {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.public.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<ClientECDHParams> {
-        let pb = PayloadU8::read(r)?;
-        Some(ClientECDHParams { public: pb })
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let pb = SizedPayload::read(r)?.into_owned();
+        Ok(Self { public: pb })
     }
 }
 
 #[derive(Debug)]
-pub struct ServerECDHParams {
-    pub curve_params: ECParameters,
-    pub public: PayloadU8,
+pub(crate) struct ClientDhParams {
+    /// RFC 5246: `opaque dh_Yc<1..2^16-1>;`
+    pub(crate) public: SizedPayload<'static, u16, NonEmpty>,
 }
 
-impl ServerECDHParams {
-    pub fn new(named_group: NamedGroup, pubkey: &[u8]) -> ServerECDHParams {
-        ServerECDHParams {
-            curve_params: ECParameters {
+impl Codec<'_> for ClientDhParams {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.public.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            public: SizedPayload::read(r)?.into_owned(),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ServerEcdhParams {
+    pub(crate) curve_params: EcParameters,
+    /// RFC 4492: `opaque point <1..2^8-1>;`
+    pub(crate) public: SizedPayload<'static, u8, NonEmpty>,
+}
+
+impl ServerEcdhParams {
+    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
+        Self {
+            curve_params: EcParameters {
                 curve_type: ECCurveType::NamedCurve,
-                named_group,
+                named_group: kx.group(),
             },
-            public: PayloadU8::new(pubkey.to_vec()),
+            public: kx.pub_key().to_vec().into(),
         }
     }
 }
 
-impl Codec for ServerECDHParams {
+impl Codec<'_> for ServerEcdhParams {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.curve_params.encode(bytes);
         self.public.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<ServerECDHParams> {
-        let cp = ECParameters::read(r)?;
-        let pb = PayloadU8::read(r)?;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let cp = EcParameters::read(r)?;
+        let pb = SizedPayload::read(r)?.into_owned();
 
-        Some(ServerECDHParams {
+        Ok(Self {
             curve_params: cp,
             public: pb,
         })
@@ -1625,168 +922,178 @@ impl Codec for ServerECDHParams {
 }
 
 #[derive(Debug)]
-pub struct ECDHEServerKeyExchange {
-    pub params: ServerECDHParams,
-    pub dss: DigitallySignedStruct,
+pub(crate) struct ServerDhParams {
+    /// RFC 5246: `opaque dh_p<1..2^16-1>;`
+    pub(crate) dh_p: SizedPayload<'static, u16, NonEmpty>,
+    /// RFC 5246: `opaque dh_g<1..2^16-1>;`
+    pub(crate) dh_g: SizedPayload<'static, u16, NonEmpty>,
+    /// RFC 5246: `opaque dh_Ys<1..2^16-1>;`
+    pub(crate) dh_ys: SizedPayload<'static, u16, NonEmpty>,
 }
 
-impl Codec for ECDHEServerKeyExchange {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        self.params.encode(bytes);
-        self.dss.encode(bytes);
+impl ServerDhParams {
+    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
+        let Some(params) = kx.ffdhe_group() else {
+            panic!("invalid NamedGroup for DHE key exchange: {:?}", kx.group());
+        };
+
+        Self {
+            dh_p: SizedPayload::from(Payload::new(params.p.to_vec())),
+            dh_g: SizedPayload::from(Payload::new(params.g.to_vec())),
+            dh_ys: SizedPayload::from(Payload::new(kx.pub_key().to_vec())),
+        }
     }
 
-    fn read(r: &mut Reader) -> Option<ECDHEServerKeyExchange> {
-        let params = ServerECDHParams::read(r)?;
-        let dss = DigitallySignedStruct::read(r)?;
+    pub(crate) fn as_ffdhe_group(&self) -> FfdheGroup<'_> {
+        FfdheGroup::from_params_trimming_leading_zeros(self.dh_p.bytes(), self.dh_g.bytes())
+    }
+}
 
-        Some(ECDHEServerKeyExchange { params, dss })
+impl Codec<'_> for ServerDhParams {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        self.dh_p.encode(bytes);
+        self.dh_g.encode(bytes);
+        self.dh_ys.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            dh_p: SizedPayload::read(r)?.into_owned(),
+            dh_g: SizedPayload::read(r)?.into_owned(),
+            dh_ys: SizedPayload::read(r)?.into_owned(),
+        })
     }
 }
 
 #[derive(Debug)]
-pub enum ServerKeyExchangePayload {
-    ECDHE(ECDHEServerKeyExchange),
-    Unknown(Payload),
+pub(crate) enum ServerKeyExchangeParams {
+    Ecdh(ServerEcdhParams),
+    Dh(ServerDhParams),
 }
 
-impl Codec for ServerKeyExchangePayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        match *self {
-            ServerKeyExchangePayload::ECDHE(ref x) => x.encode(bytes),
-            ServerKeyExchangePayload::Unknown(ref x) => x.encode(bytes),
+impl ServerKeyExchangeParams {
+    pub(crate) fn new(kx: &dyn ActiveKeyExchange) -> Self {
+        match kx.group().key_exchange_algorithm() {
+            KeyExchangeAlgorithm::DHE => Self::Dh(ServerDhParams::new(kx)),
+            KeyExchangeAlgorithm::ECDHE => Self::Ecdh(ServerEcdhParams::new(kx)),
         }
     }
 
-    fn read(r: &mut Reader) -> Option<ServerKeyExchangePayload> {
+    pub(crate) fn pub_key(&self) -> &[u8] {
+        match self {
+            Self::Ecdh(ecdh) => ecdh.public.bytes(),
+            Self::Dh(dh) => dh.dh_ys.bytes(),
+        }
+    }
+
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+        match self {
+            Self::Ecdh(ecdh) => ecdh.encode(buf),
+            Self::Dh(dh) => dh.encode(buf),
+        }
+    }
+}
+
+impl KxDecode<'_> for ServerKeyExchangeParams {
+    fn decode(r: &mut Reader<'_>, algo: KeyExchangeAlgorithm) -> Result<Self, InvalidMessage> {
+        use KeyExchangeAlgorithm::*;
+        Ok(match algo {
+            ECDHE => Self::Ecdh(ServerEcdhParams::read(r)?),
+            DHE => Self::Dh(ServerDhParams::read(r)?),
+        })
+    }
+}
+
+#[derive(Debug)]
+pub(crate) struct ServerKeyExchange {
+    pub(crate) params: ServerKeyExchangeParams,
+    pub(crate) dss: DigitallySignedStruct,
+}
+
+impl ServerKeyExchange {
+    pub(crate) fn encode(&self, buf: &mut Vec<u8>) {
+        self.params.encode(buf);
+        self.dss.encode(buf);
+    }
+}
+
+#[derive(Debug)]
+pub(crate) enum ServerKeyExchangePayload {
+    Known(ServerKeyExchange),
+    Unknown(Payload<'static>),
+}
+
+impl From<ServerKeyExchange> for ServerKeyExchangePayload {
+    fn from(value: ServerKeyExchange) -> Self {
+        Self::Known(value)
+    }
+}
+
+impl Codec<'_> for ServerKeyExchangePayload {
+    fn encode(&self, bytes: &mut Vec<u8>) {
+        match self {
+            Self::Known(x) => x.encode(bytes),
+            Self::Unknown(x) => x.encode(bytes),
+        }
+    }
+
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
         // read as Unknown, fully parse when we know the
         // KeyExchangeAlgorithm
-        Payload::read(r).map(ServerKeyExchangePayload::Unknown)
+        Ok(Self::Unknown(Payload::read(r).into_owned()))
     }
 }
 
 impl ServerKeyExchangePayload {
-    pub fn unwrap_given_kxa(&self, kxa: &KeyExchangeAlgorithm) -> Option<ServerKeyExchangePayload> {
-        if let ServerKeyExchangePayload::Unknown(ref unk) = *self {
-            let mut rd = Reader::init(&unk.0);
+    pub(crate) fn unwrap_given_kxa(&self, kxa: KeyExchangeAlgorithm) -> Option<ServerKeyExchange> {
+        if let Self::Unknown(unk) = self {
+            let mut rd = Reader::new(unk.bytes());
 
-            let result = match *kxa {
-                KeyExchangeAlgorithm::ECDHE => {
-                    ECDHEServerKeyExchange::read(&mut rd).map(ServerKeyExchangePayload::ECDHE)
-                }
-                _ => None,
+            let result = ServerKeyExchange {
+                params: ServerKeyExchangeParams::decode(&mut rd, kxa).ok()?,
+                dss: DigitallySignedStruct::read(&mut rd).ok()?,
             };
 
             if !rd.any_left() {
-                return result;
+                return Some(result);
             };
         }
 
         None
     }
-
-    pub fn encode_params(&self, bytes: &mut Vec<u8>) {
-        bytes.clear();
-
-        if let ServerKeyExchangePayload::ECDHE(ref x) = *self {
-            x.params.encode(bytes);
-        }
-    }
-
-    pub fn get_sig(&self) -> Option<DigitallySignedStruct> {
-        match *self {
-            ServerKeyExchangePayload::ECDHE(ref x) => Some(x.dss.clone()),
-            _ => None,
-        }
-    }
 }
 
-// -- EncryptedExtensions (TLS1.3 only) --
-declare_u16_vec!(EncryptedExtensions, ServerExtension);
-
-pub trait HasServerExtensions {
-    fn get_extensions(&self) -> &[ServerExtension];
-
-    /// Returns true if there is more than one extension of a given
-    /// type.
-    fn has_duplicate_extension(&self) -> bool {
-        let mut seen = collections::HashSet::new();
-
-        for ext in self.get_extensions() {
-            let typ = ext.get_type().get_u16();
-
-            if seen.contains(&typ) {
-                return true;
-            }
-            seen.insert(typ);
-        }
-
-        false
-    }
-
-    fn find_extension(&self, ext: ExtensionType) -> Option<&ServerExtension> {
-        self.get_extensions()
-            .iter()
-            .find(|x| x.get_type() == ext)
-    }
-
-    fn get_alpn_protocol(&self) -> Option<&[u8]> {
-        let ext = self.find_extension(ExtensionType::ALProtocolNegotiation)?;
-        match *ext {
-            ServerExtension::Protocols(ref protos) => protos.as_single_slice(),
-            _ => None,
-        }
-    }
-
-    fn get_quic_params_extension(&self) -> Option<Vec<u8>> {
-        let ext = self.find_extension(ExtensionType::TransportParameters)?;
-        match *ext {
-            ServerExtension::TransportParameters(ref bytes) => Some(bytes.to_vec()),
-            _ => None,
-        }
-    }
-
-    fn early_data_extension_offered(&self) -> bool {
-        self.find_extension(ExtensionType::EarlyData)
-            .is_some()
-    }
+/// RFC 5246: `ClientCertificateType certificate_types<1..2^8-1>;`
+impl TlsListElement for ClientCertificateType {
+    const SIZE_LEN: ListLength = ListLength::NonZeroU8 {
+        empty_error: InvalidMessage::IllegalEmptyList("ClientCertificateTypes"),
+    };
 }
-
-impl HasServerExtensions for EncryptedExtensions {
-    fn get_extensions(&self) -> &[ServerExtension] {
-        self
-    }
-}
-
-// -- CertificateRequest and sundries --
-declare_u8_vec!(ClientCertificateTypes, ClientCertificateType);
-pub type DistinguishedName = PayloadU16;
-pub type DistinguishedNames = VecU16OfPayloadU16;
 
 #[derive(Debug)]
-pub struct CertificateRequestPayload {
-    pub certtypes: ClientCertificateTypes,
-    pub sigschemes: SupportedSignatureSchemes,
-    pub canames: DistinguishedNames,
+pub(crate) struct CertificateRequestPayload {
+    pub(crate) certtypes: Vec<ClientCertificateType>,
+    pub(crate) sigschemes: Vec<SignatureScheme>,
+    pub(crate) canames: Vec<DistinguishedName>,
 }
 
-impl Codec for CertificateRequestPayload {
+impl Codec<'_> for CertificateRequestPayload {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.certtypes.encode(bytes);
         self.sigschemes.encode(bytes);
         self.canames.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificateRequestPayload> {
-        let certtypes = ClientCertificateTypes::read(r)?;
-        let sigschemes = SupportedSignatureSchemes::read(r)?;
-        let canames = DistinguishedNames::read(r)?;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let certtypes = Vec::read(r)?;
+        let sigschemes = Vec::read(r)?;
+        let canames = Vec::read(r)?;
 
         if sigschemes.is_empty() {
             warn!("meaningless CertificateRequest message");
-            None
+            Err(InvalidMessage::NoSignatureSchemes)
         } else {
-            Some(CertificateRequestPayload {
+            Ok(Self {
                 certtypes,
                 sigschemes,
                 canames,
@@ -1795,505 +1102,435 @@ impl Codec for CertificateRequestPayload {
     }
 }
 
-#[derive(Debug)]
-pub enum CertReqExtension {
-    SignatureAlgorithms(SupportedSignatureSchemes),
-    AuthorityNames(DistinguishedNames),
-    Unknown(UnknownExtension),
-}
+extension_struct! {
+    pub(crate) struct CertificateRequestExtensions {
+        ExtensionType::SignatureAlgorithms =>
+            pub(crate) signature_algorithms: Option<Vec<SignatureScheme>>,
 
-impl CertReqExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            CertReqExtension::SignatureAlgorithms(_) => ExtensionType::SignatureAlgorithms,
-            CertReqExtension::AuthorityNames(_) => ExtensionType::CertificateAuthorities,
-            CertReqExtension::Unknown(ref r) => r.typ,
-        }
+        ExtensionType::CertificateAuthorities =>
+            pub(crate) authority_names: Option<Vec<DistinguishedName>>,
+
+        ExtensionType::CompressCertificate =>
+            pub(crate) certificate_compression_algorithms: Option<Vec<CertificateCompressionAlgorithm>>,
     }
 }
 
-impl Codec for CertReqExtension {
+impl CertificateRequestExtensions {
+    /// Recognized but unprocessed extensions specified for CertificateRequest.
+    ///
+    /// rustls does not process these, and they are ignored if received in a
+    /// CertificateRequest message.
+    ///
+    /// See RFC 9846 section 4.3 Table 1, plus `signed_certificate_timestamp` per
+    /// its IANA "TLS 1.3" registry entry (carried over from RFC 9846 section 4.3).
+    pub(super) const UNPROCESSED: &'static [ExtensionType] = &[
+        ExtensionType::ServerName,
+        ExtensionType::StatusRequest,
+        ExtensionType::SCT,
+        ExtensionType::OIDFilters,
+        ExtensionType::SignatureAlgorithmsCert,
+    ];
+}
+
+impl Codec<'_> for CertificateRequestExtensions {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
+        let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            CertReqExtension::SignatureAlgorithms(ref r) => r.encode(&mut sub),
-            CertReqExtension::AuthorityNames(ref r) => r.encode(&mut sub),
-            CertReqExtension::Unknown(ref r) => r.encode(&mut sub),
+        for ext in Self::ALL_EXTENSIONS {
+            self.encode_one(*ext, extensions.buf);
         }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
     }
 
-    fn read(r: &mut Reader) -> Option<CertReqExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let mut out = Self::default();
+
+        let mut checker = DuplicateExtensionChecker::new();
+
+        let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
-        Some(match typ {
-            ExtensionType::SignatureAlgorithms => {
-                let schemes = SupportedSignatureSchemes::read(&mut sub)?;
-                if schemes.is_empty() {
-                    return None;
-                }
-                CertReqExtension::SignatureAlgorithms(schemes)
-            }
-            ExtensionType::CertificateAuthorities => {
-                let cas = DistinguishedNames::read(&mut sub)?;
-                CertReqExtension::AuthorityNames(cas)
-            }
-            _ => CertReqExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
+        while sub.any_left() {
+            out.read_one(&mut sub, |unknown| {
+                checker.check_unprocessed(unknown, Self::UNPROCESSED)
+            })?;
+        }
+
+        if out
+            .signature_algorithms
+            .as_ref()
+            .map(|algs| algs.is_empty())
+            .unwrap_or_default()
+        {
+            return Err(InvalidMessage::NoSignatureSchemes);
+        }
+
+        if let Some([]) = out.authority_names.as_deref() {
+            return Err(InvalidMessage::IllegalEmptyCertificateAuthoritiesExtension);
+        }
+
+        Ok(out)
     }
 }
 
-declare_u16_vec!(CertReqExtensions, CertReqExtension);
-
 #[derive(Debug)]
-pub struct CertificateRequestPayloadTLS13 {
-    pub context: PayloadU8,
-    pub extensions: CertReqExtensions,
+pub(crate) struct CertificateRequestPayloadTls13 {
+    pub(crate) context: SizedPayload<'static, u8>,
+    pub(crate) extensions: CertificateRequestExtensions,
 }
 
-impl Codec for CertificateRequestPayloadTLS13 {
+impl Codec<'_> for CertificateRequestPayloadTls13 {
     fn encode(&self, bytes: &mut Vec<u8>) {
         self.context.encode(bytes);
         self.extensions.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificateRequestPayloadTLS13> {
-        let context = PayloadU8::read(r)?;
-        let extensions = CertReqExtensions::read(r)?;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let context = SizedPayload::read(r)?.into_owned();
+        let extensions = CertificateRequestExtensions::read(r)?;
 
-        Some(CertificateRequestPayloadTLS13 {
+        Ok(Self {
             context,
             extensions,
         })
     }
 }
 
-impl CertificateRequestPayloadTLS13 {
-    pub fn find_extension(&self, ext: ExtensionType) -> Option<&CertReqExtension> {
-        self.extensions
-            .iter()
-            .find(|x| x.get_type() == ext)
-    }
-
-    pub fn get_sigalgs_extension(&self) -> Option<&SupportedSignatureSchemes> {
-        let ext = self.find_extension(ExtensionType::SignatureAlgorithms)?;
-        match *ext {
-            CertReqExtension::SignatureAlgorithms(ref sa) => Some(sa),
-            _ => None,
-        }
-    }
-
-    pub fn get_authorities_extension(&self) -> Option<&DistinguishedNames> {
-        let ext = self.find_extension(ExtensionType::CertificateAuthorities)?;
-        match *ext {
-            CertReqExtension::AuthorityNames(ref an) => Some(an),
-            _ => None,
-        }
-    }
-}
-
 // -- NewSessionTicket --
 #[derive(Debug)]
-pub struct NewSessionTicketPayload {
-    pub lifetime_hint: u32,
-    pub ticket: PayloadU16,
+pub(crate) struct NewSessionTicketPayload {
+    pub(crate) lifetime_hint: Duration,
+    // Tickets can be large (KB), so we deserialise this straight
+    // into an Arc, so it can be passed directly into the client's
+    // session object without copying.
+    pub(crate) ticket: Arc<SizedPayload<'static, u16, MaybeEmpty>>,
 }
 
 impl NewSessionTicketPayload {
-    pub fn new(lifetime_hint: u32, ticket: Vec<u8>) -> NewSessionTicketPayload {
-        NewSessionTicketPayload {
+    pub(crate) fn new(lifetime_hint: Duration, ticket: Vec<u8>) -> Self {
+        Self {
             lifetime_hint,
-            ticket: PayloadU16::new(ticket),
+            ticket: Arc::new(SizedPayload::from(Payload::new(ticket))),
         }
     }
 }
 
-impl Codec for NewSessionTicketPayload {
+impl Codec<'_> for NewSessionTicketPayload {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.lifetime_hint.encode(bytes);
+        (self.lifetime_hint.as_secs() as u32).encode(bytes);
         self.ticket.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<NewSessionTicketPayload> {
-        let lifetime = u32::read(r)?;
-        let ticket = PayloadU16::read(r)?;
-
-        Some(NewSessionTicketPayload {
-            lifetime_hint: lifetime,
-            ticket,
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            lifetime_hint: Duration::from_secs(u32::read(r)? as u64),
+            ticket: Arc::new(SizedPayload::read(r)?.into_owned()),
         })
     }
 }
 
 // -- NewSessionTicket electric boogaloo --
-#[derive(Debug)]
-pub enum NewSessionTicketExtension {
-    EarlyData(u32),
-    Unknown(UnknownExtension),
-}
-
-impl NewSessionTicketExtension {
-    pub fn get_type(&self) -> ExtensionType {
-        match *self {
-            NewSessionTicketExtension::EarlyData(_) => ExtensionType::EarlyData,
-            NewSessionTicketExtension::Unknown(ref r) => r.typ,
-        }
+extension_struct! {
+    pub(crate) struct NewSessionTicketExtensions {
+        ExtensionType::EarlyData =>
+            pub(crate) max_early_data_size: Option<u32>,
     }
 }
 
-impl Codec for NewSessionTicketExtension {
+impl Codec<'_> for NewSessionTicketExtensions {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.get_type().encode(bytes);
+        let extensions = LengthPrefixedBuffer::new(ListLength::U16, bytes);
 
-        let mut sub: Vec<u8> = Vec::new();
-        match *self {
-            NewSessionTicketExtension::EarlyData(r) => r.encode(&mut sub),
-            NewSessionTicketExtension::Unknown(ref r) => r.encode(&mut sub),
+        for ext in Self::ALL_EXTENSIONS {
+            self.encode_one(*ext, extensions.buf);
         }
-
-        (sub.len() as u16).encode(bytes);
-        bytes.append(&mut sub);
     }
 
-    fn read(r: &mut Reader) -> Option<NewSessionTicketExtension> {
-        let typ = ExtensionType::read(r)?;
-        let len = u16::read(r)? as usize;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let mut out = Self::default();
+
+        let mut checker = DuplicateExtensionChecker::new();
+
+        let len = usize::from(u16::read(r)?);
         let mut sub = r.sub(len)?;
 
-        Some(match typ {
-            ExtensionType::EarlyData => NewSessionTicketExtension::EarlyData(u32::read(&mut sub)?),
-            _ => NewSessionTicketExtension::Unknown(UnknownExtension::read(typ, &mut sub)?),
-        })
+        while sub.any_left() {
+            // `read_one` processes `early_data`, the only extension
+            // specified for NewSessionTicket, and calls this closure for
+            // other types. Every specified type is processed, so the
+            // permitted list is empty.
+            out.read_one(&mut sub, |unknown| checker.check_unprocessed(unknown, &[]))?;
+        }
+
+        Ok(out)
     }
 }
-
-declare_u16_vec!(NewSessionTicketExtensions, NewSessionTicketExtension);
 
 #[derive(Debug)]
-pub struct NewSessionTicketPayloadTLS13 {
-    pub lifetime: u32,
-    pub age_add: u32,
-    pub nonce: PayloadU8,
-    pub ticket: PayloadU16,
-    pub exts: NewSessionTicketExtensions,
+pub(crate) struct NewSessionTicketPayloadTls13 {
+    pub(crate) lifetime: Duration,
+    pub(crate) age_add: u32,
+    pub(crate) nonce: SizedPayload<'static, u8>,
+    pub(crate) ticket: Arc<SizedPayload<'static, u16, MaybeEmpty>>,
+    pub(crate) extensions: NewSessionTicketExtensions,
 }
 
-impl NewSessionTicketPayloadTLS13 {
-    pub fn new(
-        lifetime: u32,
-        age_add: u32,
-        nonce: Vec<u8>,
-        ticket: Vec<u8>,
-    ) -> NewSessionTicketPayloadTLS13 {
-        NewSessionTicketPayloadTLS13 {
+impl NewSessionTicketPayloadTls13 {
+    pub(crate) fn new(lifetime: Duration, age_add: u32, nonce: [u8; 32], ticket: Vec<u8>) -> Self {
+        Self {
             lifetime,
             age_add,
-            nonce: PayloadU8::new(nonce),
-            ticket: PayloadU16::new(ticket),
-            exts: vec![],
-        }
-    }
-
-    pub fn find_extension(&self, ext: ExtensionType) -> Option<&NewSessionTicketExtension> {
-        self.exts
-            .iter()
-            .find(|x| x.get_type() == ext)
-    }
-
-    pub fn get_max_early_data_size(&self) -> Option<u32> {
-        let ext = self.find_extension(ExtensionType::EarlyData)?;
-        match *ext {
-            NewSessionTicketExtension::EarlyData(ref sz) => Some(*sz),
-            _ => None,
+            nonce: nonce.to_vec().into(),
+            ticket: Arc::new(SizedPayload::from(Payload::new(ticket))),
+            extensions: NewSessionTicketExtensions::default(),
         }
     }
 }
 
-impl Codec for NewSessionTicketPayloadTLS13 {
+impl Codec<'_> for NewSessionTicketPayloadTls13 {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        self.lifetime.encode(bytes);
+        (self.lifetime.as_secs() as u32).encode(bytes);
         self.age_add.encode(bytes);
         self.nonce.encode(bytes);
         self.ticket.encode(bytes);
-        self.exts.encode(bytes);
+        self.extensions.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<NewSessionTicketPayloadTLS13> {
-        let lifetime = u32::read(r)?;
+    fn read(r: &mut Reader<'_>) -> Result<Self, InvalidMessage> {
+        let lifetime = Duration::from_secs(u32::read(r)? as u64);
         let age_add = u32::read(r)?;
-        let nonce = PayloadU8::read(r)?;
-        let ticket = PayloadU16::read(r)?;
-        let exts = NewSessionTicketExtensions::read(r)?;
+        let nonce = SizedPayload::read(r)?.into_owned();
+        // nb. RFC 9846: `opaque ticket<1..2^16-1>;`
+        let ticket = Arc::new(match SizedPayload::<u16, NonEmpty>::read(r) {
+            Err(InvalidMessage::IllegalEmptyList(_)) => Err(InvalidMessage::EmptyTicketValue),
+            Err(err) => Err(err),
+            Ok(pl) => Ok(SizedPayload::from(Payload::new(pl.into_vec()))),
+        }?);
+        let extensions = NewSessionTicketExtensions::read(r)?;
 
-        Some(NewSessionTicketPayloadTLS13 {
+        Ok(Self {
             lifetime,
             age_add,
             nonce,
             ticket,
-            exts,
+            extensions,
         })
     }
 }
 
-// -- RFC6066 certificate status types
+// -- RFC 6066 certificate status types
 
 /// Only supports OCSP
-#[derive(Debug)]
-pub struct CertificateStatus {
-    pub ocsp_response: PayloadU24,
+#[derive(Clone, Debug)]
+pub(crate) struct CertificateStatus<'a> {
+    /// `opaque OCSPResponse<1..2^24-1>;`
+    pub(crate) ocsp_response: SizedPayload<'a, U24, NonEmpty>,
 }
 
-impl Codec for CertificateStatus {
+impl<'a> Codec<'a> for CertificateStatus<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
         CertificateStatusType::OCSP.encode(bytes);
         self.ocsp_response.encode(bytes);
     }
 
-    fn read(r: &mut Reader) -> Option<CertificateStatus> {
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
         let typ = CertificateStatusType::read(r)?;
 
         match typ {
-            CertificateStatusType::OCSP => Some(CertificateStatus {
-                ocsp_response: PayloadU24::read(r)?,
+            CertificateStatusType::OCSP => Ok(Self {
+                ocsp_response: SizedPayload::read(r)?,
             }),
-            _ => None,
+            _ => Err(InvalidMessage::InvalidCertificateStatusType),
         }
     }
 }
 
-impl CertificateStatus {
-    pub fn new(ocsp: Vec<u8>) -> CertificateStatus {
+impl<'a> CertificateStatus<'a> {
+    pub(crate) fn new(ocsp: &'a [u8]) -> Self {
         CertificateStatus {
-            ocsp_response: PayloadU24::new(ocsp),
+            ocsp_response: SizedPayload::from(Payload::Borrowed(ocsp)),
         }
     }
 
-    pub fn take_ocsp_response(&mut self) -> Vec<u8> {
-        let new = PayloadU24::new(Vec::new());
-        mem::replace(&mut self.ocsp_response, new).0
+    pub(crate) fn into_inner(self) -> Vec<u8> {
+        self.ocsp_response.into_vec()
+    }
+
+    pub(crate) fn into_owned(self) -> CertificateStatus<'static> {
+        CertificateStatus {
+            ocsp_response: self.ocsp_response.into_owned(),
+        }
     }
 }
+
+// -- RFC 8879 compressed certificates
 
 #[derive(Debug)]
-pub enum HandshakePayload {
-    HelloRequest,
-    ClientHello(ClientHelloPayload),
-    ServerHello(ServerHelloPayload),
-    HelloRetryRequest(HelloRetryRequest),
-    Certificate(CertificatePayload),
-    CertificateTLS13(CertificatePayloadTLS13),
-    ServerKeyExchange(ServerKeyExchangePayload),
-    CertificateRequest(CertificateRequestPayload),
-    CertificateRequestTLS13(CertificateRequestPayloadTLS13),
-    CertificateVerify(DigitallySignedStruct),
-    ServerHelloDone,
-    EarlyData,
-    EndOfEarlyData,
-    ClientKeyExchange(Payload),
-    NewSessionTicket(NewSessionTicketPayload),
-    NewSessionTicketTLS13(NewSessionTicketPayloadTLS13),
-    EncryptedExtensions(EncryptedExtensions),
-    KeyUpdate(KeyUpdateRequest),
-    Finished(Payload),
-    CertificateStatus(CertificateStatus),
-    MessageHash(Payload),
-    Unknown(Payload),
+pub(crate) struct CompressedCertificatePayload<'a> {
+    pub(crate) alg: CertificateCompressionAlgorithm,
+    pub(crate) uncompressed_len: u32,
+    /// `opaque compressed_certificate_message<1..2^24-1>;`
+    pub(crate) compressed: SizedPayload<'a, U24, NonEmpty>,
 }
 
-impl HandshakePayload {
+impl<'a> Codec<'a> for CompressedCertificatePayload<'a> {
     fn encode(&self, bytes: &mut Vec<u8>) {
-        match *self {
-            HandshakePayload::HelloRequest
-            | HandshakePayload::ServerHelloDone
-            | HandshakePayload::EarlyData
-            | HandshakePayload::EndOfEarlyData => {}
-            HandshakePayload::ClientHello(ref x) => x.encode(bytes),
-            HandshakePayload::ServerHello(ref x) => x.encode(bytes),
-            HandshakePayload::HelloRetryRequest(ref x) => x.encode(bytes),
-            HandshakePayload::Certificate(ref x) => x.encode(bytes),
-            HandshakePayload::CertificateTLS13(ref x) => x.encode(bytes),
-            HandshakePayload::ServerKeyExchange(ref x) => x.encode(bytes),
-            HandshakePayload::ClientKeyExchange(ref x) => x.encode(bytes),
-            HandshakePayload::CertificateRequest(ref x) => x.encode(bytes),
-            HandshakePayload::CertificateRequestTLS13(ref x) => x.encode(bytes),
-            HandshakePayload::CertificateVerify(ref x) => x.encode(bytes),
-            HandshakePayload::NewSessionTicket(ref x) => x.encode(bytes),
-            HandshakePayload::NewSessionTicketTLS13(ref x) => x.encode(bytes),
-            HandshakePayload::EncryptedExtensions(ref x) => x.encode(bytes),
-            HandshakePayload::KeyUpdate(ref x) => x.encode(bytes),
-            HandshakePayload::Finished(ref x) => x.encode(bytes),
-            HandshakePayload::CertificateStatus(ref x) => x.encode(bytes),
-            HandshakePayload::MessageHash(ref x) => x.encode(bytes),
-            HandshakePayload::Unknown(ref x) => x.encode(bytes),
+        self.alg.encode(bytes);
+        U24(self.uncompressed_len).encode(bytes);
+        self.compressed.encode(bytes);
+    }
+
+    fn read(r: &mut Reader<'a>) -> Result<Self, InvalidMessage> {
+        Ok(Self {
+            alg: CertificateCompressionAlgorithm::read(r)?,
+            uncompressed_len: U24::read(r)?.0,
+            compressed: SizedPayload::read(r)?,
+        })
+    }
+}
+
+impl CompressedCertificatePayload<'_> {
+    pub(super) fn into_owned(self) -> CompressedCertificatePayload<'static> {
+        CompressedCertificatePayload {
+            compressed: self.compressed.into_owned(),
+            ..self
+        }
+    }
+
+    pub(crate) fn as_borrowed(&self) -> CompressedCertificatePayload<'_> {
+        CompressedCertificatePayload {
+            alg: self.alg,
+            uncompressed_len: self.uncompressed_len,
+            compressed: SizedPayload::from(Payload::Borrowed(self.compressed.bytes())),
         }
     }
 }
 
-#[derive(Debug)]
-pub struct HandshakeMessagePayload {
-    pub typ: HandshakeType,
-    pub payload: HandshakePayload,
+/// The method of encoding to use for a handshake message.
+///
+/// In some cases a handshake message may be encoded differently depending on the purpose
+/// the encoded message is being used for.
+pub(crate) enum Encoding {
+    /// Standard RFC 9846 encoding.
+    Standard,
+    /// Encoding for ECH confirmation for HRR.
+    EchConfirmation,
+    /// Encoding for ECH inner client hello.
+    EchInnerHello { to_compress: Vec<ExtensionType> },
 }
 
-impl Codec for HandshakeMessagePayload {
-    fn encode(&self, bytes: &mut Vec<u8>) {
-        // encode payload to learn length
-        let mut sub: Vec<u8> = Vec::new();
-        self.payload.encode(&mut sub);
+pub(super) fn has_duplicates<I: IntoIterator<Item = E>, E: Into<u16>>(iter: I) -> bool {
+    let mut seen = InlineSet::default();
 
-        // output type, length, and encoded payload
-        match self.typ {
-            HandshakeType::HelloRetryRequest => HandshakeType::ServerHello,
-            _ => self.typ,
+    for x in iter {
+        if !seen.insert(x.into()) {
+            return true;
         }
-        .encode(bytes);
-        codec::u24(sub.len() as u32).encode(bytes);
-        bytes.append(&mut sub);
     }
 
-    fn read(r: &mut Reader) -> Option<HandshakeMessagePayload> {
-        HandshakeMessagePayload::read_version(r, ProtocolVersion::TLSv1_2)
+    false
+}
+
+pub(super) struct DuplicateExtensionChecker(InlineSet);
+
+impl DuplicateExtensionChecker {
+    pub(super) fn new() -> Self {
+        Self(InlineSet::default())
+    }
+
+    pub(super) fn into_btreeset(self) -> BTreeSet<u16> {
+        self.0.into()
+    }
+
+    /// Check an unmodelled extension of type `typ` is appropriate for the message.
+    ///
+    /// A message must reject recognized extension types not specified for it
+    /// (RFC 9846 section 4.3).
+    ///
+    /// `permitted` lists the types that are specified for the message but
+    /// not processed by rustls. These, and unrecognized types, are ignored
+    /// (subject to the usual duplicate check).
+    pub(super) fn check_unprocessed(
+        &mut self,
+        typ: ExtensionType,
+        permitted: &[ExtensionType],
+    ) -> Result<(), InvalidMessage> {
+        match typ.is_recognized() && !permitted.contains(&typ) {
+            true => Err(InvalidMessage::MisplacedExtension(u16::from(typ))),
+            false => self.check(typ),
+        }
+    }
+
+    pub(super) fn check(&mut self, typ: ExtensionType) -> Result<(), InvalidMessage> {
+        let u = u16::from(typ);
+        match self.0.insert(u) {
+            true => Ok(()),
+            false => Err(InvalidMessage::DuplicateExtension(u)),
+        }
     }
 }
 
-impl HandshakeMessagePayload {
-    pub fn length(&self) -> usize {
-        let mut buf = Vec::new();
-        self.encode(&mut buf);
-        buf.len()
-    }
+enum InlineSet {
+    Small { slots: [u16; 8], used: usize },
+    Large(BTreeSet<u16>),
+}
 
-    pub fn read_version(r: &mut Reader, vers: ProtocolVersion) -> Option<HandshakeMessagePayload> {
-        let mut typ = HandshakeType::read(r)?;
-        let len = codec::u24::read(r)?.0 as usize;
-        let mut sub = r.sub(len)?;
-
-        let payload = match typ {
-            HandshakeType::HelloRequest if sub.left() == 0 => HandshakePayload::HelloRequest,
-            HandshakeType::ClientHello => {
-                HandshakePayload::ClientHello(ClientHelloPayload::read(&mut sub)?)
-            }
-            HandshakeType::ServerHello => {
-                let version = ProtocolVersion::read(&mut sub)?;
-                let random = Random::read(&mut sub)?;
-
-                if random == HELLO_RETRY_REQUEST_RANDOM {
-                    let mut hrr = HelloRetryRequest::read(&mut sub)?;
-                    hrr.legacy_version = version;
-                    typ = HandshakeType::HelloRetryRequest;
-                    HandshakePayload::HelloRetryRequest(hrr)
-                } else {
-                    let mut shp = ServerHelloPayload::read(&mut sub)?;
-                    shp.legacy_version = version;
-                    shp.random = random;
-                    HandshakePayload::ServerHello(shp)
-                }
-            }
-            HandshakeType::Certificate if vers == ProtocolVersion::TLSv1_3 => {
-                let p = CertificatePayloadTLS13::read(&mut sub)?;
-                HandshakePayload::CertificateTLS13(p)
-            }
-            HandshakeType::Certificate => {
-                HandshakePayload::Certificate(CertificatePayload::read(&mut sub)?)
-            }
-            HandshakeType::ServerKeyExchange => {
-                let p = ServerKeyExchangePayload::read(&mut sub)?;
-                HandshakePayload::ServerKeyExchange(p)
-            }
-            HandshakeType::ServerHelloDone => {
-                if sub.any_left() {
-                    return None;
-                }
-                HandshakePayload::ServerHelloDone
-            }
-            HandshakeType::ClientKeyExchange => {
-                HandshakePayload::ClientKeyExchange(Payload::read(&mut sub).unwrap())
-            }
-            HandshakeType::CertificateRequest if vers == ProtocolVersion::TLSv1_3 => {
-                let p = CertificateRequestPayloadTLS13::read(&mut sub)?;
-                HandshakePayload::CertificateRequestTLS13(p)
-            }
-            HandshakeType::CertificateRequest => {
-                let p = CertificateRequestPayload::read(&mut sub)?;
-                HandshakePayload::CertificateRequest(p)
-            }
-            HandshakeType::CertificateVerify => {
-                HandshakePayload::CertificateVerify(DigitallySignedStruct::read(&mut sub)?)
-            }
-            HandshakeType::NewSessionTicket if vers == ProtocolVersion::TLSv1_3 => {
-                let p = NewSessionTicketPayloadTLS13::read(&mut sub)?;
-                HandshakePayload::NewSessionTicketTLS13(p)
-            }
-            HandshakeType::NewSessionTicket => {
-                let p = NewSessionTicketPayload::read(&mut sub)?;
-                HandshakePayload::NewSessionTicket(p)
-            }
-            HandshakeType::EncryptedExtensions => {
-                HandshakePayload::EncryptedExtensions(EncryptedExtensions::read(&mut sub)?)
-            }
-            HandshakeType::KeyUpdate => {
-                HandshakePayload::KeyUpdate(KeyUpdateRequest::read(&mut sub)?)
-            }
-            HandshakeType::Finished => HandshakePayload::Finished(Payload::read(&mut sub).unwrap()),
-            HandshakeType::CertificateStatus => {
-                HandshakePayload::CertificateStatus(CertificateStatus::read(&mut sub)?)
-            }
-            HandshakeType::MessageHash => {
-                // does not appear on the wire
-                return None;
-            }
-            HandshakeType::HelloRetryRequest => {
-                // not legal on wire
-                return None;
-            }
-            _ => HandshakePayload::Unknown(Payload::read(&mut sub).unwrap()),
+impl InlineSet {
+    fn insert(&mut self, value: u16) -> bool {
+        let (slots, used) = match self {
+            Self::Small { slots, used } => (slots, used),
+            Self::Large(btree) => return btree.insert(value),
         };
 
-        if sub.any_left() {
-            None
+        if slots[..*used].contains(&value) {
+            return false;
+        }
+
+        if *used == slots.len() {
+            let mut upgraded = BTreeSet::from_iter(slots[..*used].iter().copied());
+            upgraded.insert(value);
+            *self = Self::Large(upgraded);
         } else {
-            Some(HandshakeMessagePayload { typ, payload })
+            slots[*used] = value;
+            *used += 1;
+        }
+        true
+    }
+}
+
+impl From<InlineSet> for BTreeSet<u16> {
+    fn from(value: InlineSet) -> Self {
+        match value {
+            InlineSet::Small { slots, used } => Self::from_iter(slots[..used].iter().copied()),
+            InlineSet::Large(btree) => btree,
         }
     }
+}
 
-    pub fn build_key_update_notify() -> HandshakeMessagePayload {
-        HandshakeMessagePayload {
-            typ: HandshakeType::KeyUpdate,
-            payload: HandshakePayload::KeyUpdate(KeyUpdateRequest::UpdateNotRequested),
+impl Default for InlineSet {
+    fn default() -> Self {
+        Self::Small {
+            slots: [0; 8],
+            used: 0,
         }
     }
+}
 
-    pub fn get_encoding_for_binder_signing(&self) -> Vec<u8> {
-        let mut ret = self.get_encoding();
+#[cfg(test)]
+mod tests {
+    use super::*;
 
-        let binder_len = match self.payload {
-            HandshakePayload::ClientHello(ref ch) => {
-                let offer = ch.get_psk().unwrap();
+    #[test]
+    fn test_checker() {
+        let mut c = InlineSet::default();
 
-                let mut binders_encoding = Vec::new();
-                offer
-                    .binders
-                    .encode(&mut binders_encoding);
-                binders_encoding.len()
+        for n in 0..16 {
+            assert!(c.insert(n));
+
+            for e in 0..n {
+                assert!(!c.insert(e));
             }
-            _ => 0,
-        };
-
-        let ret_len = ret.len() - binder_len;
-        ret.truncate(ret_len);
-        ret
-    }
-
-    pub fn build_handshake_hash(hash: &[u8]) -> HandshakeMessagePayload {
-        HandshakeMessagePayload {
-            typ: HandshakeType::MessageHash,
-            payload: HandshakePayload::MessageHash(Payload::new(hash.to_vec())),
         }
+
+        assert_eq!(BTreeSet::from(c), BTreeSet::from_iter(0..16));
     }
 }

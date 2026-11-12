@@ -1,4 +1,4 @@
-use std::fmt;
+use core::fmt;
 
 /// Alternative implementation of `fmt::Debug` for byte slice.
 ///
@@ -10,10 +10,10 @@ use std::fmt;
 /// This struct wraps `&[u8]` just to override `fmt::Debug`.
 ///
 /// `BsDebug` is not a part of public API of bytes crate.
-pub struct BsDebug<'a>(pub &'a [u8]);
+pub(crate) struct BsDebug<'a>(pub(crate) &'a [u8]);
 
-impl<'a> fmt::Debug for BsDebug<'a> {
-    fn fmt(&self, fmt: &mut fmt::Formatter) -> Result<(), fmt::Error> {
+impl fmt::Debug for BsDebug<'_> {
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> Result<(), fmt::Error> {
         write!(fmt, "b\"")?;
         for &c in self.0 {
             // https://doc.rust-lang.org/reference.html#byte-escapes
@@ -28,10 +28,10 @@ impl<'a> fmt::Debug for BsDebug<'a> {
             } else if c == b'\0' {
                 write!(fmt, "\\0")?;
                 // ASCII printable
-            } else if c >= 0x20 && c < 0x7f {
+            } else if (0x20..0x7f).contains(&c) {
                 write!(fmt, "{}", c as char)?;
             } else {
-                write!(fmt, "\\x{:02x}", c)?;
+                write!(fmt, "\\x{c:02x}")?;
             }
         }
         write!(fmt, "\"")?;
@@ -40,7 +40,10 @@ impl<'a> fmt::Debug for BsDebug<'a> {
 }
 
 #[cfg(test)]
-mod test {
+mod tests {
+    use alloc::vec::Vec;
+    use std::format;
+
     use super::BsDebug;
 
     #[test]
